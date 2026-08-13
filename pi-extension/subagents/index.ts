@@ -30,8 +30,10 @@ import {
 } from "./cmux.ts";
 
 import {
+  appendImagePathInstructions,
   findLastAssistantMessage,
   getNewEntries,
+  materializeLatestUserImages,
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
@@ -670,7 +672,7 @@ const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
  * control tools from subagent-done.ts would otherwise be hidden, leaving a
  * manually resumed or user-touched subagent unable to call subagent_done.
  */
-function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
+function buildSubagentToolAllowlist(effectiveTools?: string, requireRead = false): string | null {
   const requested = (effectiveTools ?? "")
     .split(",")
     .map((tool) => tool.trim())
@@ -679,6 +681,7 @@ function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   if (requested.length === 0) return null;
 
   const allow = new Set(requested);
+  if (requireRead) allow.add("read");
   for (const tool of SUBAGENT_CONTROL_TOOLS) {
     allow.add(tool);
   }
@@ -932,7 +935,15 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: {
+      getSessionFile(): string | null;
+      getSessionId(): string;
+      getSessionDir(): string;
+      getBranch(): Array<{ type?: string; message?: { role?: string; content?: unknown } }>;
+    };
+    cwd: string;
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -949,6 +960,11 @@ async function launchSubagent(
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+  const imagePaths = materializeLatestUserImages(
+    ctx.sessionManager.getBranch(),
+    join(artifactDir, "images", id),
+  );
+  const taskWithImages = appendImagePathInstructions(params.task, imagePaths);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
@@ -1004,8 +1020,8 @@ async function launchSubagent(
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = inheritsConversationContext
-    ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    ? taskWithImages
+    : `${roleBlock}\n\n${modeHint}\n\n${taskWithImages}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
@@ -1035,7 +1051,7 @@ async function launchSubagent(
 
     // Always pass the task as the prompt — even for resumed sessions,
     // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
+    cmdParts.push(shellEscape(taskWithImages));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -1111,7 +1127,7 @@ async function launchSubagent(
     parts.push(flag, shellEscape(syspromptPath));
   }
 
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
+  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, imagePaths.length > 0);
   if (toolAllowlist) {
     parts.push("--tools", shellEscape(toolAllowlist));
   }
@@ -1400,6 +1416,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Images attached to the current user message are saved as files and their absolute paths are added to the sub-agent task. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1407,6 +1424,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Images attached to the current user message are saved as files and their absolute paths are added to the sub-agent task. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +

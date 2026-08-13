@@ -1,6 +1,14 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/bmp": "bmp",
+};
 
 export interface SessionEntry {
   type: string;
@@ -18,6 +26,60 @@ export interface MessageEntry extends SessionEntry {
 }
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
+
+interface ImageContent {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+function isImageContent(value: unknown): value is ImageContent {
+  if (!value || typeof value !== "object") return false;
+  const block = value as Partial<ImageContent>;
+  return (
+    block.type === "image" &&
+    typeof block.data === "string" &&
+    block.data.length > 0 &&
+    typeof block.mimeType === "string" &&
+    IMAGE_EXTENSIONS[block.mimeType.toLowerCase()] !== undefined
+  );
+}
+
+/**
+ * Save images from the latest user message on the active branch as files that
+ * a separately launched subagent can read. Older user-message images are not
+ * included: this handoff mirrors attachments on the turn that spawned it.
+ */
+export function materializeLatestUserImages(
+  branchEntries: Array<{ type?: string; message?: { role?: string; content?: unknown } }>,
+  outputDir: string,
+): string[] {
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i];
+    if (entry.type !== "message" || entry.message?.role !== "user") continue;
+
+    const content = entry.message.content;
+    if (!Array.isArray(content)) return [];
+    const images = content.filter(isImageContent);
+    if (images.length === 0) return [];
+
+    const absoluteOutputDir = resolve(outputDir);
+    mkdirSync(absoluteOutputDir, { recursive: true, mode: 0o700 });
+    return images.map((image, index) => {
+      const extension = IMAGE_EXTENSIONS[image.mimeType.toLowerCase()];
+      const imagePath = join(absoluteOutputDir, `image-${index + 1}.${extension}`);
+      writeFileSync(imagePath, Buffer.from(image.data, "base64"), { mode: 0o600 });
+      return imagePath;
+    });
+  }
+  return [];
+}
+
+export function appendImagePathInstructions(task: string, imagePaths: string[]): string {
+  if (imagePaths.length === 0) return task;
+  const paths = imagePaths.map((imagePath) => `- ${imagePath}`).join("\n");
+  return `${task}\n\nImages attached to the current main-session user message are available at these absolute paths:\n${paths}\nRead the relevant image files with the read tool before completing the task.`;
+}
 
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
