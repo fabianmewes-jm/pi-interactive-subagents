@@ -163,6 +163,18 @@ subagent({ name: "Planner", agent: "planner", task: "Work through the design wit
 subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer", task: "..." });
 ```
 
+### Image attachments
+
+Images attached to the current main-session user message are automatically
+materialized under the session's artifact directory when a subagent is spawned.
+The extension adds their absolute paths and an instruction to use the `read`
+tool to the child task. This works in standalone, lineage-only, and fork modes
+without copying base64 image data into the child session context.
+
+Only attachments from the latest user message are handed off; older images are
+not implicitly included.
+
+### Parameters
 ### Parameters
 
 | Parameter              | Type    | Default        | Description                                                                                       |

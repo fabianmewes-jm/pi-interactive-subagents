@@ -1,16 +1,18 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
+  appendImagePathInstructions,
   getLeafId,
   getNewEntries,
   findLastAssistantMessage,
+  materializeLatestUserImages,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
@@ -255,6 +257,106 @@ describe("session.ts", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE]);
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 0);
+    });
+  });
+
+  describe("image path handoff", () => {
+    it("materializes images from the latest user message at absolute paths", () => {
+      const outputDir = join(dir, "image-handoff-latest");
+      const branch = [
+        USER_MSG,
+        ASSISTANT_MSG,
+        {
+          type: "message",
+          message: {
+            role: "user",
+            content: [
+              { type: "text", text: "Inspect these" },
+              { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+              { type: "image", data: "d29ybGQ=", mimeType: "image/jpeg" },
+            ],
+          },
+        },
+      ];
+
+      const paths = materializeLatestUserImages(branch, outputDir);
+
+      assert.deepEqual(paths, [join(outputDir, "image-1.png"), join(outputDir, "image-2.jpg")]);
+      assert.equal(readFileSync(paths[0], "utf8"), "hello");
+      assert.equal(readFileSync(paths[1], "utf8"), "world");
+      assert.equal(statSync(outputDir).mode & 0o777, 0o700);
+      assert.equal(statSync(paths[0]).mode & 0o777, 0o600);
+      assert.equal(statSync(paths[1]).mode & 0o777, 0o600);
+    });
+
+    it("returns absolute paths when the artifact directory is relative", () => {
+      const absoluteOutputDir = join(dir, "image-handoff-relative");
+      const relativeOutputDir = relative(process.cwd(), absoluteOutputDir);
+      const branch = [
+        {
+          type: "message",
+          message: {
+            role: "user",
+            content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+          },
+        },
+      ];
+
+      const paths = materializeLatestUserImages(branch, relativeOutputDir);
+
+      assert.equal(isAbsolute(paths[0]), true);
+      assert.equal(paths[0], join(absoluteOutputDir, "image-1.png"));
+    });
+
+    it("does not fall back to images from an older user message", () => {
+      const outputDir = join(dir, "image-handoff-older");
+      const branch = [
+        {
+          type: "message",
+          message: {
+            role: "user",
+            content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+          },
+        },
+        ASSISTANT_MSG,
+        USER_MSG,
+      ];
+
+      assert.deepEqual(materializeLatestUserImages(branch, outputDir), []);
+      assert.equal(existsSync(outputDir), false);
+    });
+
+    it("ignores unsupported and malformed image blocks", () => {
+      const outputDir = join(dir, "image-handoff-invalid");
+      const branch = [
+        {
+          type: "message",
+          message: {
+            role: "user",
+            content: [
+              { type: "image", data: "PHN2Zy8+", mimeType: "image/svg+xml" },
+              { type: "image", data: "", mimeType: "image/png" },
+              { type: "image", data: "aGVsbG8=" },
+            ],
+          },
+        },
+      ];
+
+      assert.deepEqual(materializeLatestUserImages(branch, outputDir), []);
+      assert.equal(existsSync(outputDir), false);
+    });
+
+    it("appends concrete paths and read instructions to the task", () => {
+      const task = appendImagePathInstructions("Review the UI", [
+        "/tmp/subagent-images/image-1.png",
+        "/tmp/subagent-images/image-2.webp",
+      ]);
+
+      assert.match(task, /^Review the UI/);
+      assert.match(task, /- \/tmp\/subagent-images\/image-1\.png/);
+      assert.match(task, /- \/tmp\/subagent-images\/image-2\.webp/);
+      assert.match(task, /Read the relevant image files with the read tool/);
+      assert.equal(appendImagePathInstructions("No images", []), "No images");
     });
   });
 
@@ -1083,6 +1185,13 @@ describe("subagent discovery", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
       "read,bash,web_search,caller_ping,subagent_done",
+    );
+  });
+
+  it("buildSubagentToolAllowlist adds read when image paths require it", () => {
+    assert.equal(
+      testApi.buildSubagentToolAllowlist("write,bash", true),
+      "write,bash,read,caller_ping,subagent_done",
     );
   });
 
