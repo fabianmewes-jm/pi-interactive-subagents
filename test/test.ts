@@ -1523,6 +1523,16 @@ describe("tool registration", () => {
     assert.equal(autoExitSchema.type, "boolean");
     assert.match(autoExitSchema.description, /Defaults to true/);
   });
+  it("registers subagents_team separately from definition discovery", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    assert.ok(registeredTools.find((tool) => tool.name === "subagents_list"));
+    const teamTool = registeredTools.find((tool) => tool.name === "subagents_team");
+    assert.ok(teamTool, "expected subagents_team tool to be registered");
+    assert.ok(teamTool.parameters.properties.pathPrefix);
+  });
+
 });
 
 describe("subagent activity snapshots", () => {
