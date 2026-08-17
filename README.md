@@ -81,11 +81,11 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 | Agent             | Model                  | Role                                                                                     |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| **planner**       | GPT-5.6 Sol (medium)   | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**         | GPT-5.6 Sol (low)      | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**        | GPT-5.6 Sol (medium)   | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**      | GPT-5.6 Sol (high)     | Reviews code for bugs, security issues, correctness                                      |
+| **visual-tester** | GPT-5.6 Sol (medium)   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 

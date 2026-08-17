@@ -1,7 +1,8 @@
 ---
 name: test-ping
 description: Integration test agent — calls caller_ping instead of completing task
-model: anthropic/claude-haiku-4-5
+model: openai-codex/gpt-5.6-sol
+thinking: low
 tools: read, bash
 spawning: false
 disable-model-invocation: true
