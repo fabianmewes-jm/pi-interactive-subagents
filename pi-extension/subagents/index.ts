@@ -14,6 +14,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -55,9 +56,21 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import {
+  abandonAgentReservation,
+  initializeTeam,
+  listTeamAgents,
+  releaseAgentSlot,
+  reserveAgentSlot,
+  teamEnvironment,
+  updateAgent,
+  type TeamContext,
+} from "./team.ts";
+import { loadTeamConfig } from "./config.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+const teamConfig = loadTeamConfig();
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -417,6 +430,22 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
+function getTeamContext(ctx: {
+  sessionManager: {
+    getSessionFile(): string | null | undefined;
+    getSessionId(): string;
+    getSessionDir(): string;
+  };
+}): TeamContext {
+  const sessionPath = ctx.sessionManager.getSessionFile();
+  if (!sessionPath) throw new Error("No session file");
+  return initializeTeam({
+    artifactDir: getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()),
+    sessionPath,
+    ...(process.env.PI_SUBAGENT_THREAD_CAP ? {} : { threadCap: teamConfig.maxThreads }),
+  });
+}
+
 const statusConfig = loadStatusConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
@@ -483,6 +512,8 @@ interface SubagentResult {
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   ping?: { name: string; message: string };
+  /** Watcher detached on extension/session shutdown; the child remains team-owned. */
+  detached?: boolean;
 }
 
 /**
@@ -490,6 +521,9 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   id: string;
+  runId: string;
+  agentPath: string;
+  team: TeamContext;
   name: string;
   task: string;
   agent?: string;
@@ -757,7 +791,10 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
   | { error: string } {
   const requestedId = params.id?.trim();
   if (requestedId) {
-    const running = runningSubagents.get(requestedId);
+    const running = runningSubagents.get(requestedId) ??
+      Array.from(runningSubagents.values()).find((candidate) =>
+        candidate.runId === requestedId || candidate.agentPath === requestedId
+      );
     return running ? { running } : { error: `No running subagent with id "${requestedId}".` };
   }
 
@@ -829,6 +866,9 @@ function handleSubagentInterrupt(
   }
 
   running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  if (running.team && running.runId) {
+    updateAgent(running.team, running.runId, { status: "interrupted" });
+  }
   updateWidget();
 
   return {
@@ -861,6 +901,14 @@ function startStatusRefresh(pi: ExtensionAPI) {
         shouldRefreshWidget = true;
       }
       running.statusState = nextState;
+      const teamStatus = snapshot.kind === "waiting" || snapshot.kind === "stalled"
+        ? "waiting"
+        : "running";
+      try {
+        updateAgent(running.team, running.runId, { status: teamStatus });
+      } catch {
+        // UI refresh must survive externally removed registry metadata.
+      }
 
       // Interactive subagents (long-running, user-driven) intentionally don't
       // wake the parent session on stalled/recovered transitions — the user is
@@ -937,7 +985,7 @@ async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: {
     sessionManager: {
-      getSessionFile(): string | null;
+      getSessionFile(): string | null | undefined;
       getSessionId(): string;
       getSessionDir(): string;
       getBranch(): Array<{ type?: string; message?: { role?: string; content?: unknown } }>;
@@ -947,7 +995,8 @@ async function launchSubagent(
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
-  const id = Math.random().toString(16).slice(2, 10);
+  const runId = randomUUID();
+  const id = runId.slice(0, 8);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
@@ -981,11 +1030,31 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 6),
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const team = getTeamContext(ctx);
+  const teamAgent = reserveAgentSlot(team, {
+    runId,
+    displayName: params.name,
+    role: params.agent,
+    sessionPath: subagentSessionFile,
+    launchPolicy: {
+      task: params.task,
+      agent: params.agent,
+      model: effectiveModel,
+      thinking: effectiveThinking,
+      tools: effectiveTools,
+      skills: effectiveSkills,
+      cwd: targetCwdForSession,
+      interactive: effectiveInteractive,
+      cli: agentDefs?.cli,
+    },
+  });
+  let surface: string | undefined;
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
+  try {
+  // Use pre-created surface (parallel mode) or create a new one. Capacity has
+  // already been reserved atomically across the whole team.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  surface = options?.surface ?? createSurface(params.name);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1054,7 +1123,10 @@ async function launchSubagent(
     cmdParts.push(shellEscape(taskWithImages));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const teamEnvPrefix = Object.entries(teamEnvironment(team, teamAgent))
+      .map(([key, value]) => `${key}=${shellEscape(value)}`)
+      .join(" ");
+    const command = `${cdPrefix}${teamEnvPrefix} ${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1073,8 +1145,12 @@ async function launchSubagent(
       ].join("\n"),
     });
 
+    updateAgent(team, runId, { surface, status: "running" });
     const running: RunningSubagent = {
       id,
+      runId,
+      agentPath: teamAgent.path,
+      team,
       name: params.name,
       task: params.task,
       agent: params.agent,
@@ -1146,6 +1222,9 @@ async function launchSubagent(
   if (denySet.size > 0) {
     envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
   }
+  for (const [key, value] of Object.entries(teamEnvironment(team, teamAgent))) {
+    envParts.push(`${key}=${shellEscape(value)}`);
+  }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
@@ -1212,8 +1291,20 @@ async function launchSubagent(
     ].join("\n"),
   });
 
+  updateAgent(team, runId, {
+    surface,
+    status: "running",
+    launchPolicy: {
+      ...teamAgent.launchPolicy,
+      activityFile,
+      launchScriptFile,
+    },
+  });
   const running: RunningSubagent = {
     id,
+    runId,
+    agentPath: teamAgent.path,
+    team,
     name: params.name,
     task: params.task,
     agent: params.agent,
@@ -1231,6 +1322,13 @@ async function launchSubagent(
 
   runningSubagents.set(id, running);
   return running;
+  } catch (error) {
+    if (surface) {
+      try { closeSurface(surface); } catch {}
+    }
+    abandonAgentReservation(team, runId);
+    throw error;
+  }
 }
 
 /**
@@ -1264,9 +1362,10 @@ async function watchSubagent(
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const moduleSignal = getModuleAbortSignal();
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1309,6 +1408,7 @@ async function watchSubagent(
 
       closeSurface(surface);
       runningSubagents.delete(running.id);
+      releaseAgentSlot(running.team, running.runId, result.exitCode === 0 ? "completed" : "errored");
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
@@ -1334,6 +1434,7 @@ async function watchSubagent(
 
     closeSurface(surface);
     runningSubagents.delete(running.id);
+    releaseAgentSlot(running.team, running.runId, result.exitCode === 0 && !result.errorMessage ? "completed" : "errored");
 
     return {
       name,
@@ -1346,22 +1447,25 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
   } catch (err: any) {
+    // Module reload and parent shutdown detach the local watcher only. They do
+    // not prove that the independently hosted child pane has terminated.
+    if (signal.aborted || moduleSignal.aborted) {
+      runningSubagents.delete(running.id);
+      return {
+        name,
+        task,
+        summary: "Subagent watcher detached; child remains active.",
+        exitCode: 0,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        detached: true,
+        sessionFile,
+      };
+    }
     try {
       closeSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
-
-    if (signal.aborted) {
-      return {
-        name,
-        task,
-        summary: "Subagent cancelled.",
-        exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
-        sessionFile,
-      };
-    }
+    releaseAgentSlot(running.team, running.runId, "errored");
     return {
       name,
       task,
@@ -1373,10 +1477,74 @@ async function watchSubagent(
   }
 }
 
+function reconcileTeamWatchers(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  let team: TeamContext;
+  try {
+    team = getTeamContext(ctx);
+  } catch {
+    return;
+  }
+  const terminal = new Set(["completed", "errored"]);
+  for (const record of listTeamAgents(team)) {
+    if (record.parentPath !== team.agentPath || terminal.has(record.status) || !record.surface) continue;
+    const id = record.runId.slice(0, 8);
+    if (runningSubagents.has(id)) continue;
+    const policy = record.launchPolicy;
+    const startTime = Date.parse(record.createdAt) || Date.now();
+    const running: RunningSubagent = {
+      id,
+      runId: record.runId,
+      agentPath: record.path,
+      team,
+      name: record.displayName,
+      task: typeof policy.task === "string" ? policy.task : "reconciled subagent",
+      agent: record.role,
+      surface: record.surface,
+      startTime,
+      sessionFile: record.sessionPath,
+      launchScriptFile: typeof policy.launchScriptFile === "string" ? policy.launchScriptFile : undefined,
+      activityFile: typeof policy.activityFile === "string" ? policy.activityFile : undefined,
+      cli: policy.cli === "claude" ? "claude" : undefined,
+      interactive: policy.interactive === true,
+      statusState: createStatusState({ source: policy.cli === "claude" ? "claude" : "pi", startTimeMs: startTime }),
+    };
+    runningSubagents.set(id, running);
+    const watcherAbort = new AbortController();
+    running.abortController = watcherAbort;
+    watchSubagent(running, watcherAbort.signal).then((result) => {
+      updateWidget();
+      if (result.detached) return;
+      pi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: resolveResultPresentation(result, running.name),
+          display: true,
+          details: {
+            id: running.runId,
+            path: running.agentPath,
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    }).catch(() => {});
+  }
+  if (runningSubagents.size > 0) {
+    startWidgetRefresh();
+    startStatusRefresh(pi);
+  }
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    reconcileTeamWatchers(pi, ctx);
   });
 
   // Clean up on session shutdown
@@ -1464,8 +1632,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        // Launch the subagent (reserves team capacity before creating a pane).
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent(params, ctx);
+        } catch (error: any) {
+          const message = error?.message ?? String(error);
+          return {
+            content: [{ type: "text" as const, text: `Subagent launch failed: ${message}` }],
+            details: { error: message },
+          };
+        }
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -1480,6 +1657,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            if (result.detached) return;
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -1549,6 +1727,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ],
           details: {
             id: running.id,
+            runId: running.runId,
+            path: running.agentPath,
             name: params.name,
             task: params.task,
             agent: params.agent,
@@ -1723,6 +1903,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+  // ── subagents_team tool (runtime hierarchy; distinct from definition discovery) ──
+  if (shouldRegister("subagents_team"))
+    pi.registerTool({
+      name: "subagents_team",
+      label: "Subagent Team",
+      description:
+        "List this orchestration team's runtime hierarchy and normalized lifecycle status. " +
+        "This is an activity snapshot, not a polling/wait tool.",
+      promptSnippet:
+        "List this orchestration team's runtime hierarchy. Do not repeatedly call it to wait for completion; terminal results arrive automatically.",
+      parameters: Type.Object({
+        pathPrefix: Type.Optional(Type.String({ description: "Optional canonical path prefix" })),
+      }),
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const team = getTeamContext(ctx);
+        const agents = listTeamAgents(team, params.pathPrefix);
+        const lines = agents.map((agent) =>
+          `${agent.path} [${agent.status}] — ${agent.displayName}` +
+          `${agent.role ? ` (${agent.role})` : ""} · ${agent.runId}` +
+          `${agent.parentPath ? ` · parent ${agent.parentPath}` : ""}`,
+        );
+        return {
+          content: [{ type: "text" as const, text: lines.length > 0 ? lines.join("\n") : "No team agents found." }],
+          details: { teamId: team.teamId, teamDir: team.teamDir, agents },
+        };
+      },
+    });
+
   // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
     pi.registerTool({
@@ -1793,7 +2001,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const name = params.name ?? "Resume";
         const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
-        const id = Math.random().toString(16).slice(2, 10);
+        const runId = randomUUID();
+        const id = runId.slice(0, 8);
 
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
@@ -1808,10 +2017,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Record entry count before resuming so we can extract new messages
+        // Record entry count before resuming so we can extract new messages.
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
-
-        const surface = createSurface(name);
+        const team = getTeamContext(ctx);
+        const teamAgent = reserveAgentSlot(team, {
+          runId,
+          displayName: name,
+          sessionPath: params.sessionPath,
+          launchPolicy: { autoExit, interactive, task: params.message ?? "resumed session" },
+        });
+        let surface: string | undefined;
+        try {
+        surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
@@ -1846,6 +2063,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
+        for (const [key, value] of Object.entries(teamEnvironment(team, teamAgent))) {
+          resumeEnvParts.push(`${key}=${shellEscape(value)}`);
+        }
         if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
@@ -1880,9 +2100,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ].join("\n"),
         });
 
+        updateAgent(team, runId, {
+          surface,
+          status: "running",
+          launchPolicy: {
+            ...teamAgent.launchPolicy,
+            activityFile,
+            launchScriptFile,
+          },
+        });
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
+          runId,
+          agentPath: teamAgent.path,
+          team,
           name,
           task: params.message ?? "resumed session",
           surface,
@@ -1907,6 +2139,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+            if (result.detached) return;
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
@@ -1974,10 +2207,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id,
             name,
             sessionPath: params.sessionPath,
+            runId,
+            path: teamAgent.path,
             launchScriptFile,
             status: "started",
           },
         };
+        } catch (error) {
+          if (surface) {
+            try { closeSurface(surface); } catch {}
+          }
+          abandonAgentReservation(team, runId);
+          const message = (error as any)?.message ?? String(error);
+          return {
+            content: [{ type: "text" as const, text: `Subagent resume failed: ${message}` }],
+            details: { error: message },
+          };
+        }
       },
     });
 

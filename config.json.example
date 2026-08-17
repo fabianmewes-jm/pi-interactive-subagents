@@ -1,5 +1,8 @@
 {
   "status": {
     "enabled": true
+  },
+  "team": {
+    "maxThreads": 4
   }
 }
