@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import {
   abandonAgentReservation,
   initializeTeam,
@@ -56,16 +58,42 @@ describe("team registry and capacity", () => {
     assert.equal(listTeamAgents(context).length, 4);
   }));
 
-  it("atomically gives the final slot to only one contender", async () => {
+  it("atomically gives the final slot to only one cross-process contender", async () => {
     const root = mkdtempSync(join(tmpdir(), "pi-team-race-"));
     try {
       const { context } = makeTeam(root, 2);
-      const outcomes = await Promise.allSettled([
-        Promise.resolve().then(() => reserve(context, "left")),
-        Promise.resolve().then(() => reserve(context, "right")),
-      ]);
-      assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
-      assert.equal(outcomes.filter((outcome) => outcome.status === "rejected").length, 1);
+      const teamModule = pathToFileURL(join(process.cwd(), "pi-extension/subagents/team.ts")).href;
+      const script = `
+        import { reserveAgentSlot } from ${JSON.stringify(teamModule)};
+        process.on("message", ({ context, name }) => {
+          try {
+            const agent = reserveAgentSlot(context, { displayName: name, sessionPath: "/" + name + ".jsonl" });
+            process.send({ ok: true, runId: agent.runId });
+          } catch (error) {
+            process.send({ ok: false, error: error.message });
+          }
+        });
+      `;
+      const contender = (name: string) => new Promise<{ ok: boolean; error?: string }>((resolveResult, reject) => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+          stdio: ["ignore", "ignore", "pipe", "ipc"],
+        });
+        let stderr = "";
+        child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+        child.once("error", reject);
+        child.once("message", (message) => {
+          resolveResult(message as { ok: boolean; error?: string });
+          child.disconnect();
+        });
+        child.send({ context, name });
+        child.once("exit", (code) => {
+          if (code && code !== 0) reject(new Error(stderr || `contender exited ${code}`));
+        });
+      });
+      const outcomes = await Promise.all([contender("left"), contender("right")]);
+      assert.equal(outcomes.filter((outcome) => outcome.ok).length, 1);
+      assert.equal(outcomes.filter((outcome) => !outcome.ok).length, 1);
+      assert.match(outcomes.find((outcome) => !outcome.ok)?.error ?? "", /capacity reached/i);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
