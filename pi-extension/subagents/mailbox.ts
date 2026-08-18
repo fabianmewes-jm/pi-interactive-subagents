@@ -9,7 +9,9 @@ import {
   renameSync,
   rmSync,
   statSync,
+  watch,
   writeFileSync,
+  type FSWatcher,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -47,6 +49,7 @@ export interface MailboxProvenance {
 
 export interface MailboxEnvelope {
   version: 1;
+  delivery?: "queue" | "followUp";
   id: string;
   sequence: number;
   teamId: string;
@@ -78,6 +81,8 @@ export interface MailboxOptions {
   /** Internal idempotency key. The child-facing tool never accepts this. */
   id?: string;
   provenance?: MailboxProvenance;
+  /** Internal delivery policy. The child-facing queue-only tool never accepts this. */
+  delivery?: "queue" | "followUp";
 }
 
 export interface MailboxDeliveryState extends MailboxProvenance {}
@@ -93,6 +98,23 @@ export interface MailboxPersistence {
   getEntries(): readonly unknown[];
 }
 
+export interface FollowupWakeApi {
+  sendMessage(
+    message: { customType: string; content: string; display: boolean; details: unknown },
+    options: { triggerTurn: true; deliverAs: "followUp" },
+  ): void;
+}
+
+export interface FollowupWatchOptions {
+  watcherFactory?: (path: string, listener: () => void) => Pick<FSWatcher, "close"> &
+    Partial<Pick<FSWatcher, "unref">>;
+  initialWakeArmed?: boolean;
+  initialArmedIds?: string[];
+  initialWakeToken?: string;
+  initialActive?: boolean;
+  deliveryState?: MailboxDeliveryState;
+}
+
 function directories(teamDir: string, recipientRunId?: string) {
   const root = join(teamDir, "mailboxes");
   const recipient = recipientRunId ? join(root, recipientRunId) : null;
@@ -106,6 +128,8 @@ function directories(teamDir: string, recipientRunId?: string) {
     inflight: recipient ? join(recipient, "inflight") : null,
     delivered: recipient ? join(recipient, "delivered") : null,
     claimLock: recipient ? join(recipient, ".claim.lock") : null,
+    exitIntent: recipient ? join(recipient, ".followup-exit-intent.json") : null,
+    wakeState: recipient ? join(recipient, ".followup-wake.json") : null,
   };
 }
 
@@ -349,6 +373,9 @@ export async function enqueueMailboxMessage(
     if (!currentRecipient || TERMINAL.has(currentRecipient.status)) {
       throw new Error(`Cannot send a mailbox message to terminal agent ${recipient.path}.`);
     }
+    if (options.delivery === "followUp" && readJson(paths.exitIntent!)) {
+      throw new Error(`Cannot send a follow-up to agent ${recipient.path}; it is shutting down.`);
+    }
     const duplicate = findById(paths.pending!, id) ?? findById(paths.inflight!, id) ??
       findById(paths.delivered!, id);
     if (duplicate) return duplicate;
@@ -374,6 +401,7 @@ export async function enqueueMailboxMessage(
     const sequence = readSequence(paths.sequence) + 1;
     const envelope: MailboxEnvelope = {
       version: 1,
+      delivery: options.delivery ?? "queue",
       id,
       sequence,
       teamId: sender.context.teamId,
@@ -397,6 +425,253 @@ export async function enqueueMailboxMessage(
   } finally {
     release();
   }
+}
+
+export async function enqueueFollowupMessage(
+  sender: MailboxIdentity,
+  target: string,
+  message: string,
+  options: MailboxOptions = {},
+): Promise<MailboxEnvelope> {
+  assertIdentity(sender);
+  const recipient = resolveTeamMessageTarget(sender.context, target, sender.agent.runId);
+  if (recipient.path === "/root") {
+    throw new Error("The root coordinator cannot be a follow-up target.");
+  }
+  return enqueueMailboxMessage(sender, target, message, { ...options, delivery: "followUp" });
+}
+
+function isFollowupEnvelope(envelope: MailboxEnvelope | null): envelope is MailboxEnvelope {
+  return envelope?.version === 1 && envelope.delivery === "followUp";
+}
+
+function hasFollowupFiles(paths: ReturnType<typeof directories>): boolean {
+  return [...readEnvelopeFiles(paths.pending!), ...readEnvelopeFiles(paths.inflight!)]
+    .some((item) => isFollowupEnvelope(item.envelope));
+}
+
+interface PersistedFollowupWake {
+  version: 1;
+  token: string;
+  messageIds: string[];
+  createdAt: string;
+}
+
+function readPersistedFollowupWake(path: string): PersistedFollowupWake | null {
+  const value = readJson<PersistedFollowupWake>(path);
+  if (value?.version !== 1 || !SAFE_ID.test(value.token) ||
+      !Array.isArray(value.messageIds) || value.messageIds.length === 0 ||
+      value.messageIds.some((id) => typeof id !== "string" || !SAFE_ID.test(id)) ||
+      new Set(value.messageIds).size !== value.messageIds.length) return null;
+  return value;
+}
+
+export interface FollowupWakeController {
+  readonly runId: string;
+  readonly wakeArmed: boolean;
+  readonly armedMessageIds: readonly string[];
+  readonly wakeToken: string | null;
+  readonly wakeCount: number;
+  readonly active: boolean;
+  start(): void;
+  markActive(): void;
+  settle(): Promise<void>;
+  setPersistence(persistence: MailboxPersistence): Promise<void>;
+  scanAndWake(): Promise<boolean>;
+  reconcilePersistence(): Promise<boolean>;
+  observeMessage(message: unknown): void;
+  prepareAutoExit(): Promise<boolean>;
+  dispose(): void;
+}
+
+/** Install target-local wake delivery; fs.watch is a hint backed by scans. */
+export function createFollowupWakeController(
+  pi: FollowupWakeApi,
+  recipient: MailboxIdentity,
+  options: FollowupWatchOptions = {},
+): FollowupWakeController {
+  assertIdentity(recipient);
+  const paths = directories(recipient.context.teamDir, recipient.agent.runId);
+  ensurePrivateDir(paths.recipient!);
+  ensurePrivateDir(paths.pending!);
+  ensurePrivateDir(paths.inflight!);
+  // A new child process (including resume) re-opens this run identity.
+  rmSync(paths.exitIntent!, { force: true });
+
+  const recoveredWake = readPersistedFollowupWake(paths.wakeState!);
+  let armedIds = [...(options.initialArmedIds ?? recoveredWake?.messageIds ?? [])];
+  let wakeToken = options.initialWakeToken ?? recoveredWake?.token ?? null;
+  let armed = options.initialWakeArmed === true && armedIds.length > 0 && wakeToken != null;
+  let recovering = recoveredWake != null && !armed;
+  let active = options.initialActive === true;
+  let generation = armed ? 1 : 0;
+  let successfulWakeCount = armed ? 1 : 0;
+  let armingPromise: Promise<boolean> | null = null;
+  let disposed = false;
+  let persistence: MailboxPersistence | null = null;
+  let watcher: (Pick<FSWatcher, "close"> & Partial<Pick<FSWatcher, "unref">>) | null = null;
+
+  const controller: FollowupWakeController = {
+    runId: recipient.agent.runId,
+    get wakeArmed() { return armed; },
+    get armedMessageIds() { return [...armedIds]; },
+    get wakeToken() { return wakeToken; },
+    get wakeCount() { return successfulWakeCount; },
+    get active() { return active; },
+    start() {
+      if (disposed || watcher) return;
+      void controller.scanAndWake().catch(() => {});
+      const factory = options.watcherFactory ?? ((path, listener) => watch(path, listener));
+      watcher = factory(paths.pending!, () => {
+        void controller.scanAndWake().catch(() => {});
+      });
+      watcher.unref?.();
+      void controller.scanAndWake().catch(() => {});
+    },
+    markActive() {
+      active = true;
+    },
+    async settle() {
+      active = false;
+      await controller.reconcilePersistence();
+      await controller.scanAndWake();
+    },
+    async setPersistence(value) {
+      persistence = value;
+      await controller.reconcilePersistence();
+      if (recovering) {
+        // A new process cannot retain Pi's in-memory queue. Persistence was
+        // checked first; an unpersisted prepared batch is safe to resend.
+        recovering = false;
+        armed = false;
+        armedIds = [];
+        wakeToken = null;
+        rmSync(paths.wakeState!, { force: true });
+      }
+      if (!active) await controller.scanAndWake();
+    },
+    async scanAndWake() {
+      if (disposed) return false;
+      // Concurrent lifecycle and fs.watch scans share the same attempt. In
+      // particular, a quiescent lifecycle drain must observe a synchronous
+      // send/claim failure even when a watch hint reached the attempt first.
+      if (armingPromise) return await armingPromise;
+      const hasFollowup = hasFollowupFiles(paths);
+      if (active || !persistence || armed || !hasFollowup) {
+        return false;
+      }
+      const attempt = (async () => {
+        if (active || armed || !hasFollowupFiles(paths)) return false;
+        const messages = await claimMailboxBatch(recipient);
+        if (messages.length === 0) return false;
+        const token = randomUUID();
+        generation++;
+        armed = true;
+        armedIds = messages.map((message) => message.id);
+        wakeToken = token;
+        atomicWriteJson(paths.wakeState!, {
+          version: 1,
+          token,
+          messageIds: armedIds,
+          createdAt: new Date().toISOString(),
+        } satisfies PersistedFollowupWake);
+        pi.sendMessage(
+          mailboxCustomMessage(messages, recipient.agent.runId, {
+            wakeGeneration: generation,
+            wakeToken: token,
+          }),
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+        successfulWakeCount++;
+        return true;
+      })();
+      armingPromise = attempt;
+      try {
+        return await attempt;
+      } catch (error) {
+        armed = false;
+        armedIds = [];
+        wakeToken = null;
+        rmSync(paths.wakeState!, { force: true });
+        throw error;
+      } finally {
+        if (armingPromise === attempt) armingPromise = null;
+      }
+    },
+    async reconcilePersistence() {
+      if (!persistence || !wakeToken || armedIds.length === 0) return false;
+      const persisted = await acknowledgePersistedFollowupWake(
+        recipient,
+        persistence,
+        wakeToken,
+        armedIds,
+      );
+      if (!persisted) {
+        return false;
+      }
+      armed = false;
+      armedIds = [];
+      wakeToken = null;
+      recovering = false;
+      if (!disposed && !active) await controller.scanAndWake();
+      return true;
+    },
+    observeMessage(value) {
+      const message = value as {
+        role?: string;
+        customType?: string;
+        details?: { mailboxId?: unknown; wakeToken?: unknown; messageIds?: unknown };
+      };
+      if (message?.role !== "custom" || message.customType !== "subagent_mailbox" ||
+          message.details?.mailboxId !== recipient.agent.runId ||
+          message.details?.wakeToken !== wakeToken ||
+          !Array.isArray(message.details?.messageIds) || !armed) return;
+      const ids = message.details.messageIds.filter((id): id is string => typeof id === "string");
+      if (armedIds.length !== ids.length || !armedIds.every((id, index) => ids[index] === id)) return;
+      const messages = readEnvelopeFiles(paths.inflight!)
+        .map((item) => item.envelope)
+        .filter((item): item is MailboxEnvelope => item != null && ids.includes(item.id))
+        .sort((a, b) => a.sequence - b.sequence);
+      if (messages.length > 0 && options.deliveryState) {
+        const furthest = messages.reduce(
+          (best, item) => item.hops >= best.hops ? item : best,
+          messages[0],
+        );
+        options.deliveryState.hops = furthest.hops;
+        options.deliveryState.route = [...furthest.route];
+      }
+    },
+    async prepareAutoExit() {
+      await controller.reconcilePersistence();
+      if (armed) return true;
+      let suppressExit = false;
+      const release = await acquireTeamMailboxCommitLock(recipient.context.teamDir);
+      try {
+        suppressExit = armed || hasFollowupFiles(paths);
+        if (!suppressExit) {
+          atomicWriteJson(paths.exitIntent!, {
+            version: 1,
+            runId: recipient.agent.runId,
+            createdAt: new Date().toISOString(),
+          });
+        }
+      } finally {
+        release();
+      }
+      // The decision is committed under the mailbox lock, but Pi delivery is
+      // target-local and must happen after releasing it. Propagate this drain's
+      // failure so lifecycle retry can recover rather than strand durable work.
+      if (suppressExit && !disposed && !armed) await controller.scanAndWake();
+      return suppressExit;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      watcher?.close();
+      watcher = null;
+    },
+  };
+  return controller;
 }
 
 function readEnvelopeFiles(dir: string): Array<{ name: string; envelope: MailboxEnvelope | null }> {
@@ -507,6 +782,85 @@ export function persistedMailboxMessageIds(
   return ids;
 }
 
+async function acknowledgePersistedFollowupWake(
+  recipient: MailboxIdentity,
+  persistence: MailboxPersistence,
+  token: string,
+  messageIds: readonly string[],
+  options: MailboxOptions = {},
+): Promise<boolean> {
+  assertIdentity(recipient);
+  const matching = persistence.getEntries().filter((value) => {
+    const entry = value as {
+      type?: string;
+      customType?: string;
+      details?: { mailboxId?: unknown; wakeToken?: unknown; messageIds?: unknown };
+    };
+    return entry?.type === "custom_message" && entry.customType === "subagent_mailbox" &&
+      entry.details?.mailboxId === recipient.agent.runId && entry.details?.wakeToken === token &&
+      Array.isArray(entry.details?.messageIds) &&
+      entry.details.messageIds.length === messageIds.length &&
+      entry.details.messageIds.every((id, index) => id === messageIds[index]);
+  });
+  if (matching.length !== 1) return false;
+
+  const paths = directories(recipient.context.teamDir, recipient.agent.runId);
+  ensurePrivateDir(paths.inflight!);
+  ensurePrivateDir(paths.delivered!);
+  const release = await acquireLock(paths.claimLock!, options);
+  try {
+    const inflight = readEnvelopeFiles(paths.inflight!)
+      .map((item) => item.envelope)
+      .filter((item): item is MailboxEnvelope => item != null)
+      .sort((a, b) => a.sequence - b.sequence);
+    const delivered = readEnvelopeFiles(paths.delivered!)
+      .map((item) => item.envelope)
+      .filter((item): item is MailboxEnvelope => item != null);
+    const exact = messageIds.map((id) =>
+      inflight.find((item) => item.id === id) ?? delivered.find((item) => item.id === id)
+    );
+    if (exact.some((item) => item == null) ||
+        exact.some((item, index) => item!.id !== messageIds[index])) return false;
+    for (const id of messageIds) {
+      if (!inflight.some((item) => item.id === id)) continue;
+      try {
+        renameSync(
+          join(paths.inflight!, mailboxFileName(id)),
+          join(paths.delivered!, mailboxFileName(id)),
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    rmSync(paths.wakeState!, { force: true });
+    return true;
+  } finally {
+    release();
+  }
+}
+
+export async function acknowledgePersistedMailbox(
+  recipient: MailboxIdentity,
+  persistence: MailboxPersistence,
+  options: MailboxOptions = {},
+): Promise<Set<string>> {
+  assertIdentity(recipient);
+  const paths = directories(recipient.context.teamDir, recipient.agent.runId);
+  ensurePrivateDir(paths.inflight!);
+  ensurePrivateDir(paths.delivered!);
+  const release = await acquireLock(paths.claimLock!, options);
+  try {
+    const persisted = persistedMailboxMessageIds(
+      persistence.getEntries(),
+      recipient.agent.runId,
+    );
+    reconcilePersistedClaims(paths, persisted);
+    return persisted;
+  } finally {
+    release();
+  }
+}
+
 export function formatMailboxBatch(messages: MailboxEnvelope[]): string {
   const lines = [
     "Direct mailbox messages (queued and delivered at this agent-turn boundary):",
@@ -521,6 +875,29 @@ export function formatMailboxBatch(messages: MailboxEnvelope[]): string {
     );
   });
   return lines.join("\n");
+}
+
+export function mailboxCustomMessage(
+  messages: MailboxEnvelope[],
+  mailboxId: string,
+  extraDetails: Record<string, unknown> = {},
+) {
+  return {
+    customType: "subagent_mailbox",
+    content: formatMailboxBatch(messages),
+    display: true,
+    details: {
+      mailboxId,
+      messageIds: messages.map((message) => message.id),
+      sequences: messages.map((message) => message.sequence),
+      senders: messages.map((message) => ({
+        runId: message.senderRunId,
+        path: message.senderPath,
+        name: message.senderName,
+      })),
+      ...extraDetails,
+    },
+  };
 }
 
 export async function deliverMailboxAtTurnBoundary(
@@ -552,24 +929,7 @@ export async function deliverMailboxAtTurnBoundary(
       state.hops = furthest.hops;
       state.route = [...furthest.route];
     }
-    pi.sendMessage(
-      {
-        customType: "subagent_mailbox",
-        content: formatMailboxBatch(messages),
-        display: true,
-        details: {
-          mailboxId: recipient.agent.runId,
-          messageIds: messages.map((message) => message.id),
-          sequences: messages.map((message) => message.sequence),
-          senders: messages.map((message) => ({
-            runId: message.senderRunId,
-            path: message.senderPath,
-            name: message.senderName,
-          })),
-        },
-      },
-      { triggerTurn: false },
-    );
+    pi.sendMessage(mailboxCustomMessage(messages, recipient.agent.runId), { triggerTurn: false });
     const persistedAfter = persistedMailboxMessageIds(
       persistence?.getEntries() ?? [],
       recipient.agent.runId,

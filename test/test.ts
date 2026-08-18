@@ -1188,14 +1188,14 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_message,subagent_done",
+      "read,bash,web_search,caller_ping,subagent_message,subagent_followup,subagent_done",
     );
   });
 
   it("buildSubagentToolAllowlist adds read when image paths require it", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("write,bash", true),
-      "write,bash,read,caller_ping,subagent_message,subagent_done",
+      "write,bash,read,caller_ping,subagent_message,subagent_followup,subagent_done",
     );
   });
 
@@ -1502,6 +1502,14 @@ describe("tool registration", () => {
     const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
     assert.ok(messageTool);
     assert.deepEqual(Object.keys(messageTool.parameters.properties).sort(), ["message", "target"]);
+  });
+
+  it("registers subagent_followup as a child control tool", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentDoneExtension(api);
+    const followupTool = registeredTools.find((tool) => tool.name === "subagent_followup");
+    assert.ok(followupTool);
+    assert.deepEqual(Object.keys(followupTool.parameters.properties).sort(), ["message", "target"]);
   });
 
   it("registers subagent_message for the root coordinator", () => {
