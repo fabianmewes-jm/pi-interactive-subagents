@@ -26,6 +26,9 @@ import {
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
+  cleanupCmuxScenarioSurfaces,
+  snapshotCmuxSurfaces,
+  untrackSurface,
   startPi,
   waitForScreen,
   waitForFile,
@@ -46,7 +49,7 @@ if (backends.length === 0) {
 }
 
 for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
+  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 5 }, () => {
     let prevMux: string | undefined;
     let env: TestEnv;
 
@@ -268,6 +271,141 @@ for (const backend of backends) {
         const delivered = await waitForFile(deliveredFile, PI_TIMEOUT, /DELIVERED_/);
         assert.match(delivered, new RegExp(`DELIVERED_${id}`));
         assert.equal(readdirSync(pendingDir).filter((name) => name.endsWith(".json")).length, 0);
+      });
+    }
+
+    if (backend === "cmux") {
+      it("wakes an idle sibling by follow-up and routes nested completion to its direct parent", async () => {
+        const id = uniqueId();
+        const readyFile = `/tmp/pi-integ-followup-ready-${id}.txt`;
+        const waitingGateFile = `/tmp/pi-integ-followup-waiting-${id}.txt`;
+        const infoFile = `/tmp/pi-integ-followup-info-${id}.txt`;
+        const queuedFile = `/tmp/pi-integ-followup-queued-${id}.txt`;
+        const nestedFile = `/tmp/pi-integ-followup-nested-${id}.txt`;
+        const deliveredFile = `/tmp/pi-integ-followup-delivered-${id}.txt`;
+        for (const file of [
+          readyFile,
+          waitingGateFile,
+          infoFile,
+          queuedFile,
+          nestedFile,
+          deliveredFile,
+        ]) trackTempFile(env, file);
+
+        const surfacesBefore = snapshotCmuxSurfaces();
+        let surface = "";
+        let workerRunId = "";
+        let teamDir = "";
+        try {
+        surface = createTrackedSurface(env, `followup-${id}`, {
+          cmuxOwnership: { baseline: surfacesBefore, titleFragment: id },
+        });
+        await sleep(1000);
+
+        const nestedTask = `Run: echo 'NESTED_${id}' > '${nestedFile}'.`;
+        const workerTask = [
+          `Run this exact bash command first:`,
+          `printf '%s\\n%s\\n' "$PI_SUBAGENT_RUN_ID" "$PI_SUBAGENT_TEAM_DIR" > '${infoFile}'; echo 'READY_${id}' > '${readyFile}'`,
+          `Then finish your response and remain idle. Do not call subagent_done.`,
+          `On the later attributed subagent_mailbox follow-up, obey its actual contents exactly.`,
+          `Do not infer follow-up work from this initial task or from transport metadata.`,
+        ].join("\n");
+        const followupMessage = [
+          `Continue in this same run now.`,
+          `Call subagent once with name "Nested-${id}", agent "test-echo", interactive false, cwd ${JSON.stringify(env.dir)}, and task ${JSON.stringify(nestedTask)}.`,
+          `Only after its automatic result reaches you, run: echo 'DELIVERED_${id}' > '${deliveredFile}'`,
+          `Then call subagent_done.`,
+        ].join("\n");
+        const scoutTask = [
+          `Run: while [ ! -f '${waitingGateFile}' ]; do sleep 1; done`,
+          `Then call subagent_followup with target "Worker-${id}" and message ${JSON.stringify(followupMessage)}.`,
+          `After it acknowledges, run: echo 'QUEUED_${id}' > '${queuedFile}'`,
+          `Then call subagent_done.`,
+        ].join("\n");
+        const task = [
+          `Call subagent twice without waiting for either result.`,
+          `First: name "Worker-${id}", task ${JSON.stringify(workerTask)}, interactive true.`,
+          `Second: name "Scout-${id}", task ${JSON.stringify(scoutTask)}, interactive false.`,
+          `Do not send commands, messages, interrupts, or resumes to Worker.`,
+        ].join("\n");
+
+        startPi(surface, env.dir, task);
+        await waitForFile(readyFile, PI_TIMEOUT, /READY_/);
+        const info = await waitForFile(infoFile, PI_TIMEOUT);
+        [workerRunId, teamDir] = info.trim().split("\n");
+        assert.ok(workerRunId && teamDir, `Invalid Worker follow-up metadata: ${info}`);
+
+        const activityFile = JSON.parse(
+          readFileSync(`${teamDir}/agents/${workerRunId}.json`, "utf8"),
+        ).launchPolicy.activityFile;
+        const waitingStarted = Date.now();
+        let observedWaiting = false;
+        while (Date.now() - waitingStarted < PI_TIMEOUT) {
+          try {
+            const agent = JSON.parse(readFileSync(`${teamDir}/agents/${workerRunId}.json`, "utf8"));
+            const activity = JSON.parse(readFileSync(activityFile, "utf8"));
+            if (agent.status === "waiting" && activity.phase === "waiting") {
+              observedWaiting = true;
+              break;
+            }
+          } catch {}
+          await sleep(200);
+        }
+        assert.equal(observedWaiting, true, "Worker must be authoritatively idle before follow-up");
+        writeFileSync(waitingGateFile, `WAITING_${id}\n`);
+
+        await waitForFile(queuedFile, PI_TIMEOUT, /QUEUED_/);
+        await waitForFile(nestedFile, PI_TIMEOUT, /NESTED_/);
+        const delivered = await waitForFile(deliveredFile, PI_TIMEOUT, /DELIVERED_/);
+        assert.match(delivered, new RegExp(`DELIVERED_${id}`));
+
+        const agents = readdirSync(`${teamDir}/agents`)
+          .map((name) => JSON.parse(readFileSync(`${teamDir}/agents/${name}`, "utf8")));
+        const worker = agents.find((agent) => agent.runId === workerRunId);
+        const nested = agents.find((agent) => agent.displayName === `Nested-${id}`);
+        assert.ok(worker, "Worker registry record should remain available");
+        assert.ok(nested, "Worker should have spawned the nested child after its follow-up wake");
+        assert.equal(nested.parentPath, worker.path, "nested completion must route to its direct parent");
+        assert.equal(nested.launchPolicy.autoExit, true, "nested test agent must terminate deterministically");
+        assert.equal(nested.launchPolicy.interactive, false);
+
+        const workerEntries = readFileSync(worker.sessionPath, "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line));
+        const mailboxEntries = workerEntries.filter((entry) =>
+          entry.type === "custom_message" && entry.customType === "subagent_mailbox"
+        );
+        assert.equal(mailboxEntries.length, 1, "attributed durable batch must be model-visible exactly once");
+        assert.match(mailboxEntries[0].content, new RegExp(`Nested-${id}`));
+        const nestedResults = workerEntries.filter((entry) =>
+          entry.type === "custom_message" && entry.customType === "subagent_result" &&
+          entry.details?.name === nested.displayName
+        );
+        assert.equal(nestedResults.length, 1, "nested completion must persist in the direct parent's session");
+        const root = agents.find((agent) => agent.parentPath == null);
+        assert.ok(root);
+        const rootEntries = readFileSync(root.sessionPath, "utf8")
+          .trim().split("\n").map((line) => JSON.parse(line));
+        assert.equal(rootEntries.some((entry) =>
+          entry.type === "custom_message" && entry.customType === "subagent_result" &&
+          entry.details?.name === nested.displayName
+        ), false, "nested result must not bypass its direct parent");
+        const mailboxDir = `${teamDir}/mailboxes/${workerRunId}`;
+        assert.equal(readdirSync(`${mailboxDir}/pending`).filter((name) => name.endsWith(".json")).length, 0);
+        assert.equal(readdirSync(`${mailboxDir}/inflight`).filter((name) => name.endsWith(".json")).length, 0);
+        assert.equal(readdirSync(`${mailboxDir}/delivered`).filter((name) => name.endsWith(".json")).length, 1);
+        } finally {
+          const explicitRefs = [surface];
+          if (teamDir) {
+            try {
+              for (const name of readdirSync(`${teamDir}/agents`)) {
+                const agent = JSON.parse(readFileSync(`${teamDir}/agents/${name}`, "utf8"));
+                if (typeof agent.surface === "string") explicitRefs.push(agent.surface);
+              }
+            } catch {}
+          }
+          const closed = cleanupCmuxScenarioSurfaces(surfacesBefore, id, explicitRefs);
+          if (surface && closed.includes(surface)) untrackSurface(env, surface);
+        }
       });
     }
 

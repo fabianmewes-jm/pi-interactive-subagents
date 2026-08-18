@@ -9,9 +9,12 @@ import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import {
+  createFollowupWakeController,
   deliverMailboxAtTurnBoundary,
+  enqueueFollowupMessage,
   enqueueMailboxMessage,
   mailboxIdentityFromEnvironment,
+  type FollowupWakeController,
   type MailboxDeliveryState,
   type MailboxIdentity,
 } from "./mailbox.ts";
@@ -82,6 +85,16 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+const FOLLOWUP_CONTROLLER_KEY = Symbol.for("pi-subagents/followup-wake-controller");
+const MAX_SETTLE_RETRIES = 3;
+const SETTLE_RETRY_DELAYS_MS = [10, 50, 200] as const;
+
+interface FollowupReloadState {
+  runId: string;
+  controller: FollowupWakeController;
+  cancelPendingLifecycle?: () => void;
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -102,6 +115,40 @@ export default function (pi: ExtensionAPI) {
   function getMailboxIdentity(): MailboxIdentity {
     mailboxIdentity ??= mailboxIdentityFromEnvironment();
     return mailboxIdentity;
+  }
+
+  let followupController: FollowupWakeController | null = null;
+  let followupReloadState: FollowupReloadState | null = null;
+  if (process.env.PI_SUBAGENT_TEAM_DIR && process.env.PI_SUBAGENT_RUN_ID) {
+    const stored = (globalThis as any)[FOLLOWUP_CONTROLLER_KEY] as
+      | FollowupReloadState
+      | FollowupWakeController
+      | undefined;
+    // Accept the pre-reload controller-only shape when this extension replaces
+    // an older in-memory copy.
+    const previousState = stored && "controller" in stored ? stored : undefined;
+    const previous = previousState?.controller ??
+      (stored && "runId" in stored && "settle" in stored ? stored : undefined);
+    const inheritArmed = previous?.runId === process.env.PI_SUBAGENT_RUN_ID && previous.wakeArmed;
+    const inheritActivity = previous?.runId === process.env.PI_SUBAGENT_RUN_ID;
+    const inheritedIds = inheritArmed ? [...(previous?.armedMessageIds ?? [])] : [];
+    previousState?.cancelPendingLifecycle?.();
+    previous?.dispose();
+    followupController = createFollowupWakeController(pi, getMailboxIdentity(), {
+      initialWakeArmed: inheritArmed,
+      initialArmedIds: inheritedIds,
+      initialWakeToken: inheritArmed ? previous?.wakeToken ?? undefined : undefined,
+      // Same-process extension reloads preserve whether this run was already
+      // quiescent. A genuinely new process has no prior controller and starts
+      // active until its initial prompt reaches agent_end.
+      initialActive: inheritActivity ? previous!.active : true,
+      deliveryState: mailboxState,
+    });
+    followupReloadState = {
+      runId: process.env.PI_SUBAGENT_RUN_ID,
+      controller: followupController,
+    };
+    (globalThis as any)[FOLLOWUP_CONTROLLER_KEY] = followupReloadState;
   }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
@@ -157,10 +204,139 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let lifecycleGeneration = 0;
+  let latestAgentEnd: { generation: number; wakeCount: number; event: any; ctx: any } | null = null;
+  const settleHandles = new Set<NodeJS.Immediate>();
+  const settleRetryHandles = new Map<number, NodeJS.Timeout>();
+  const settleRetryAttempts = new Map<number, number>();
+  const settlingGenerations = new Set<number>();
+  const settledGenerations = new Set<number>();
+  let lifecycleCancelled = false;
+
+  function cancelPendingLifecycle(): void {
+    lifecycleCancelled = true;
+    for (const handle of settleHandles) clearImmediate(handle);
+    settleHandles.clear();
+    for (const handle of settleRetryHandles.values()) clearTimeout(handle);
+    settleRetryHandles.clear();
+    settleRetryAttempts.clear();
+    settlingGenerations.clear();
+    latestAgentEnd = null;
+  }
+
+  if (followupReloadState) {
+    followupReloadState.cancelPendingLifecycle = cancelPendingLifecycle;
+  }
+
+  function markLifecycleActive(): void {
+    lifecycleGeneration++;
+    for (const handle of settleHandles) clearImmediate(handle);
+    settleHandles.clear();
+    for (const handle of settleRetryHandles.values()) clearTimeout(handle);
+    settleRetryHandles.clear();
+    settleRetryAttempts.clear();
+    settledGenerations.clear();
+    latestAgentEnd = null;
+    followupController?.markActive();
+  }
+
+  function scheduleSettleRetry(
+    generation: number,
+    wakeCountAtEnd: number,
+    event: any,
+    ctx: any,
+  ): void {
+    if (lifecycleCancelled || generation !== lifecycleGeneration || settledGenerations.has(generation) ||
+        settleRetryHandles.has(generation)) return;
+    const attempt = (settleRetryAttempts.get(generation) ?? 0) + 1;
+    if (attempt > MAX_SETTLE_RETRIES) return;
+    settleRetryAttempts.set(generation, attempt);
+    const handle = setTimeout(() => {
+      settleRetryHandles.delete(generation);
+      void settleAgent(generation, wakeCountAtEnd, event, ctx);
+    }, SETTLE_RETRY_DELAYS_MS[attempt - 1]);
+    handle.unref?.();
+    settleRetryHandles.set(generation, handle);
+  }
+
+  async function settleAgent(
+    generation: number,
+    wakeCountAtEnd: number,
+    event: any,
+    ctx: any,
+  ): Promise<void> {
+    if (lifecycleCancelled) return;
+    if (generation !== lifecycleGeneration) return;
+    if (settledGenerations.has(generation)) return;
+    if (settlingGenerations.has(generation)) return;
+    settlingGenerations.add(generation);
+    try {
+      await followupController?.settle();
+      if (lifecycleCancelled) return;
+      // A batch armed by this quiescent drain owns the next Pi turn. Never let
+      // synchronous test/session persistence turn that send into same-tick exit.
+      if (followupController?.wakeArmed ||
+          (followupController?.wakeCount ?? 0) > wakeCountAtEnd) {
+        settledGenerations.add(generation);
+        settleRetryAttempts.delete(generation);
+        return;
+      }
+      if (generation !== lifecycleGeneration) return;
+
+      const messages = event?.messages as any[] | undefined;
+      let shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+      if (shouldExit && followupController) {
+        shouldExit = !(await followupController.prepareAutoExit());
+      }
+      if (lifecycleCancelled || generation !== lifecycleGeneration) return;
+
+      settledGenerations.add(generation);
+      settleRetryAttempts.delete(generation);
+      const retryHandle = settleRetryHandles.get(generation);
+      if (retryHandle) clearTimeout(retryHandle);
+      settleRetryHandles.delete(generation);
+      if (!shouldExit) return;
+
+      const errorInfo = findLatestAssistantError(messages);
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (errorInfo && sessionFile) {
+        try {
+          writeFileSync(`${sessionFile}.exit`, JSON.stringify({
+            type: "error",
+            errorMessage: errorInfo.errorMessage,
+            stopReason: errorInfo.stopReason,
+          }));
+        } catch {}
+      }
+      recorder.agentEndDone();
+      ctx.shutdown();
+    } catch {
+      scheduleSettleRetry(generation, wakeCountAtEnd, event, ctx);
+    } finally {
+      settlingGenerations.delete(generation);
+    }
+  }
+
+  function scheduleSettledFallback(event: any, ctx: any): void {
+    const generation = lifecycleGeneration;
+    const wakeCount = followupController?.wakeCount ?? 0;
+    latestAgentEnd = { generation, wakeCount, event, ctx };
+    const handle = setImmediate(() => {
+      settleHandles.delete(handle);
+      void settleAgent(generation, wakeCount, event, ctx).catch(() => {});
+    });
+    settleHandles.add(handle);
+  }
 
   // Show widget + status bar on session start
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     recorder.sessionStart();
+    try {
+      await followupController?.setPersistence(ctx.sessionManager);
+    } finally {
+      // First scan precedes installation; start() installs and scans again.
+      followupController?.start();
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -177,8 +353,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
+    markLifecycleActive();
     recorder.beforeAgentStart();
     if (!process.env.PI_SUBAGENT_TEAM_DIR) return;
+    await followupController?.reconcilePersistence();
+    // A target-local follow-up already owns its exact inflight batch. A normal
+    // prompt must not inject that batch a second time before custom persistence.
+    if (followupController?.wakeArmed) return;
     await deliverMailboxAtTurnBoundary(
       pi,
       getMailboxIdentity(),
@@ -186,53 +367,37 @@ export default function (pi: ExtensionAPI) {
       {},
       ctx.sessionManager,
     );
+    await followupController?.scanAndWake();
   });
 
   pi.on("agent_start", () => {
+    markLifecycleActive();
     agentStarted = true;
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
-
-    if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
-      }
-
-      recorder.agentEndDone();
-      ctx.shutdown();
-      return;
-    }
-
     recorder.agentEndWaiting();
     if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
       userTookOver = false;
     }
+    // Never send or resend from agent_end. Upstream Pi 0.65 lacks an extension
+    // settled event, so a guarded macrotask observes true quiescence instead.
+    scheduleSettledFallback(event as any, ctx);
   });
+
+  try {
+    (pi.on as any)("agent_settled", () => {
+      const pending = latestAgentEnd;
+      if (!pending) return;
+      void settleAgent(
+        pending.generation,
+        pending.wakeCount,
+        pending.event,
+        pending.ctx,
+      ).catch(() => {});
+    });
+  } catch {}
 
   pi.on("turn_start", (event) => {
     recorder.turnStart((event as any).turnIndex);
@@ -252,6 +417,17 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("message_update", (event) => {
     recorder.messageUpdate((event as any).assistantMessageEvent?.type);
+  });
+
+  pi.on("message_start", (event) => {
+    followupController?.observeMessage((event as any).message);
+  });
+
+  pi.on("message_end", (event) => {
+    followupController?.observeMessage((event as any).message);
+    // Pi 0.65 persists custom entries immediately after extension message_end
+    // handlers return. The next event-loop phase observes only the durable entry.
+    setImmediate(() => { void followupController?.reconcilePersistence().catch(() => {}); });
   });
 
   pi.on("tool_execution_start", (event) => {
@@ -275,7 +451,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    cancelPendingLifecycle();
+    settledGenerations.clear();
     recorder.sessionShutdown((event as any).reason);
+    followupController?.dispose();
+    if ((event as any).reason !== "reload" &&
+        (globalThis as any)[FOLLOWUP_CONTROLLER_KEY] === followupReloadState) {
+      (globalThis as any)[FOLLOWUP_CONTROLLER_KEY] = null;
+    }
   });
 
   // Toggle expand/collapse with Ctrl+J
@@ -360,6 +543,50 @@ export default function (pi: ExtensionAPI) {
         const message = (error as Error).message;
         return {
           content: [{ type: "text" as const, text: `Message was not queued: ${message}` }],
+          details: { error: message },
+        };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_followup",
+    label: "Follow Up Subagent",
+    description:
+      "Queue a durable attributed message and safely wake the target in its existing run. " +
+      "If the target is active, Pi queues the follow-up without interrupting its turn or tool calls. " +
+      "The root coordinator, this agent, terminal agents, and agents outside this team are invalid targets.",
+    parameters: Type.Object({
+      target: Type.String({ description: "Target run ID, team path, or unique display name" }),
+      message: Type.String({ description: "Message to deliver in the target's existing run" }),
+    }),
+    async execute(_toolCallId, params) {
+      try {
+        const queued = await enqueueFollowupMessage(
+          getMailboxIdentity(),
+          params.target,
+          params.message,
+          { provenance: mailboxState },
+        );
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              `Follow-up queued for ${queued.recipientName} (${queued.recipientPath}). ` +
+              "Its target process will safely start or queue the next turn.",
+          }],
+          details: {
+            id: queued.id,
+            sequence: queued.sequence,
+            targetRunId: queued.recipientRunId,
+            targetPath: queued.recipientPath,
+            status: "followup_queued",
+          },
+        };
+      } catch (error) {
+        const message = (error as Error).message;
+        return {
+          content: [{ type: "text" as const, text: `Follow-up was not queued: ${message}` }],
           details: { error: message },
         };
       }

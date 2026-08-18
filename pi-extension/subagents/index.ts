@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -72,6 +72,7 @@ import {
 import { loadTeamConfig } from "./config.ts";
 import {
   deliverMailboxAtTurnBoundary,
+  enqueueFollowupMessage,
   enqueueMailboxMessage,
   mailboxIdentityForContext,
   type MailboxDeliveryState,
@@ -544,10 +545,10 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
+function loadAgentDefaults(agentName: string, cwd = process.cwd()): AgentDefaults | null {
   const configDir = getAgentConfigDir();
   const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
+    join(cwd, ".pi", "agents", `${agentName}.md`),
     join(configDir, "agents", `${agentName}.md`),
     join(getBundledAgentsDir(), `${agentName}.md`),
   ];
@@ -869,7 +870,12 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_message", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = [
+  "caller_ping",
+  "subagent_message",
+  "subagent_followup",
+  "subagent_done",
+] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -1266,7 +1272,8 @@ async function launchSubagent(
   const runId = randomUUID();
   const id = runId.slice(0, 8);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const definitionCwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent, definitionCwd) : null;
   const effective = resolveEffectiveLaunchOptions(params, agentDefs);
   const effectiveModel = effective.model;
   const effectiveTools = effective.tools;
@@ -1460,6 +1467,8 @@ async function launchSubagent(
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+  const forcedExtension = process.env.PI_SUBAGENT_EXTENSION_SOURCE?.trim();
+  if (forcedExtension) parts.push("-ne", "-e", shellEscape(forcedExtension));
   parts.push("-e", shellEscape(subagentDonePath));
 
   const piModelSpec = buildPiModelSpec(effectiveModel, effectiveThinking);
@@ -1916,6 +1925,53 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const message = (error as Error).message;
           return {
             content: [{ type: "text" as const, text: `Message was not queued: ${message}` }],
+            details: { error: message },
+          };
+        }
+      },
+    });
+
+  // ── durable safe follow-up tool (root; children register it in subagent-done.ts) ──
+  if (!process.env.PI_SUBAGENT_RUN_ID && shouldRegister("subagent_followup"))
+    pi.registerTool({
+      name: "subagent_followup",
+      label: "Follow Up Subagent",
+      description:
+        "Queue a durable attributed message and safely wake an active team agent in its existing run. " +
+        "If the target is busy, Pi queues the follow-up without interrupting its turn or tool calls. " +
+        "The root coordinator is never a valid target.",
+      parameters: Type.Object({
+        target: Type.String({ description: "Target run ID, team path, or unique display name" }),
+        message: Type.String({ description: "Message to deliver in the target's existing run" }),
+      }),
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        try {
+          const team = getTeamContext(ctx);
+          const queued = await enqueueFollowupMessage(
+            mailboxIdentityForContext(team),
+            params.target,
+            params.message,
+            { provenance: rootMailboxState },
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                `Follow-up queued for ${queued.recipientName} (${queued.recipientPath}). ` +
+                "Its target process will safely start or queue the next turn.",
+            }],
+            details: {
+              id: queued.id,
+              sequence: queued.sequence,
+              targetRunId: queued.recipientRunId,
+              targetPath: queued.recipientPath,
+              status: "followup_queued",
+            },
+          };
+        } catch (error) {
+          const message = (error as Error).message;
+          return {
+            content: [{ type: "text" as const, text: `Follow-up was not queued: ${message}` }],
             details: { error: message },
           };
         }
@@ -2424,6 +2480,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+        const forcedExtension = process.env.PI_SUBAGENT_EXTENSION_SOURCE?.trim();
+        if (forcedExtension) parts.push("-ne", "-e", shellEscape(forcedExtension));
         parts.push("-e", shellEscape(subagentDonePath));
 
         const resumeModelSpec = buildPiModelSpec(model, thinking);

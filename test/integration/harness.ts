@@ -52,6 +52,89 @@ export {
 };
 export type { MuxBackend };
 
+export interface CmuxSurfaceSnapshot {
+  ref: string;
+  title: string;
+}
+
+/** Parse stable surface refs and titles from `cmux tree --all`. */
+export function parseCmuxSurfaceSnapshot(tree: string): CmuxSurfaceSnapshot[] {
+  const surfaces: CmuxSurfaceSnapshot[] = [];
+  for (const line of tree.split("\n")) {
+    const match = line.match(/\bsurface\s+(surface:\d+)\b[^\n]*?"([^"]*)"/);
+    if (match) surfaces.push({ ref: match[1], title: match[2] });
+  }
+  return surfaces;
+}
+
+export function snapshotCmuxSurfaces(): CmuxSurfaceSnapshot[] | null {
+  try {
+    return parseCmuxSurfaceSnapshot(
+      execFileSync("cmux", ["tree", "--all"], { encoding: "utf8" }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Select only newly-created surfaces whose title belongs to one scenario. */
+export function selectNewCmuxScenarioSurfaces(
+  before: readonly CmuxSurfaceSnapshot[],
+  after: readonly CmuxSurfaceSnapshot[],
+  titleFragment: string,
+): string[] {
+  const preexisting = new Set(before.map((surface) => surface.ref));
+  return after
+    .filter((surface) => !preexisting.has(surface.ref) && surface.title.includes(titleFragment))
+    .map((surface) => surface.ref);
+}
+
+/** Best-effort cleanup guarded against closing any surface that predated the scenario. */
+export interface CmuxCleanupOperations {
+  snapshot?: () => CmuxSurfaceSnapshot[] | null;
+  close?: (ref: string) => void;
+}
+
+export function cleanupCmuxScenarioSurfaces(
+  before: readonly CmuxSurfaceSnapshot[] | null,
+  titleFragment: string,
+  explicitRefs: readonly string[] = [],
+  operations: CmuxCleanupOperations = {},
+): string[] {
+  if (!before) return [];
+  const takeSnapshot = operations.snapshot ?? snapshotCmuxSurfaces;
+  const close = operations.close ?? closeSurface;
+  const preexisting = new Set(before.map((surface) => surface.ref));
+  const current = takeSnapshot();
+  if (!current) return [];
+  const currentByRef = new Map<string, CmuxSurfaceSnapshot[]>();
+  for (const surface of current) {
+    currentByRef.set(surface.ref, [...(currentByRef.get(surface.ref) ?? []), surface]);
+  }
+  const ownsCurrentRef = (ref: string) => {
+    const matches = currentByRef.get(ref) ?? [];
+    return matches.length === 1 && matches[0].title.includes(titleFragment);
+  };
+  const candidates = new Set(
+    selectNewCmuxScenarioSurfaces(before, current, titleFragment)
+      .filter(ownsCurrentRef),
+  );
+  for (const ref of explicitRefs) {
+    if (ref && !preexisting.has(ref) && ownsCurrentRef(ref)) candidates.add(ref);
+  }
+  const closeSucceeded = new Set<string>();
+  for (const ref of candidates) {
+    try {
+      close(ref);
+      closeSucceeded.add(ref);
+    } catch {}
+  }
+  const final = takeSnapshot();
+  if (!final) return [];
+  const remaining = new Set(final.map((surface) => surface.ref));
+  return [...closeSucceeded].filter((ref) => !remaining.has(ref));
+}
+
 // ── Paths ──
 
 const HARNESS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -180,13 +263,21 @@ export async function waitForFocusedSurface(
 
 // ── Test environment ──
 
+export interface TrackedSurface {
+  ref: string;
+  cmuxOwnership?: {
+    baseline: readonly CmuxSurfaceSnapshot[] | null;
+    titleFragment: string;
+  };
+}
+
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
   /** Active mux backend for this test run */
   backend: MuxBackend;
   /** Surfaces created during the test (cleaned up automatically) */
-  surfaces: string[];
+  surfaces: TrackedSurface[];
   /** Temp files to clean up */
   tempFiles: string[];
 }
@@ -215,12 +306,38 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
 /**
  * Clean up all resources created during the test.
  */
-export function cleanupTestEnv(env: TestEnv): void {
-  for (const surface of env.surfaces) {
+export function cleanupTrackedSurfaces(
+  env: TestEnv,
+  operations: CmuxCleanupOperations = {},
+): string[] {
+  const confirmedClosed: string[] = [];
+  const remaining: TrackedSurface[] = [];
+  const close = operations.close ?? closeSurface;
+  for (const tracked of env.surfaces) {
+    if (env.backend === "cmux" && tracked.cmuxOwnership) {
+      const closed = cleanupCmuxScenarioSurfaces(
+        tracked.cmuxOwnership.baseline,
+        tracked.cmuxOwnership.titleFragment,
+        [tracked.ref],
+        operations,
+      );
+      if (closed.includes(tracked.ref)) confirmedClosed.push(tracked.ref);
+      else remaining.push(tracked);
+      continue;
+    }
     try {
-      closeSurface(surface);
-    } catch {}
+      close(tracked.ref);
+      confirmedClosed.push(tracked.ref);
+    } catch {
+      remaining.push(tracked);
+    }
   }
+  env.surfaces = remaining;
+  return confirmedClosed;
+}
+
+export function cleanupTestEnv(env: TestEnv): void {
+  cleanupTrackedSurfaces(env);
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
@@ -234,9 +351,13 @@ export function cleanupTestEnv(env: TestEnv): void {
 /**
  * Create a surface and register it for automatic cleanup.
  */
-export function createTrackedSurface(env: TestEnv, name: string): string {
+export function createTrackedSurface(
+  env: TestEnv,
+  name: string,
+  options: { cmuxOwnership?: TrackedSurface["cmuxOwnership"] } = {},
+): string {
   const surface = createSurface(name);
-  env.surfaces.push(surface);
+  env.surfaces.push({ ref: surface, cmuxOwnership: options.cmuxOwnership });
   return surface;
 }
 
@@ -247,7 +368,7 @@ export function createTrackedSurfaceSplit(
   fromSurface?: string,
 ): string {
   const surface = createSurfaceSplit(name, direction, fromSurface);
-  env.surfaces.push(surface);
+  env.surfaces.push({ ref: surface });
   return surface;
 }
 
@@ -255,7 +376,7 @@ export function createTrackedSurfaceSplit(
  * Remove a surface from tracking (after manual close).
  */
 export function untrackSurface(env: TestEnv, surface: string): void {
-  env.surfaces = env.surfaces.filter((s) => s !== surface);
+  env.surfaces = env.surfaces.filter((tracked) => tracked.ref !== surface);
 }
 
 // ── Pi session management ──
@@ -282,6 +403,7 @@ export function startPi(
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
+    `PI_SUBAGENT_EXTENSION_SOURCE=${shellEscape(EXTENSION_SOURCE)}`,
     `pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
