@@ -70,6 +70,12 @@ import {
   type TeamContext,
 } from "./team.ts";
 import { loadTeamConfig } from "./config.ts";
+import {
+  deliverMailboxAtTurnBoundary,
+  enqueueMailboxMessage,
+  mailboxIdentityForContext,
+  type MailboxDeliveryState,
+} from "./mailbox.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -863,7 +869,7 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_message", "subagent_done"] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -1604,7 +1610,7 @@ async function launchSubagent(
     if (surface) {
       try { closeSurface(surface); } catch {}
     }
-    abandonAgentReservation(team, runId);
+    await abandonAgentReservation(team, runId);
     throw error;
   }
 }
@@ -1685,8 +1691,8 @@ async function watchSubagent(
       }
 
       closeSurface(surface);
+      await releaseAgentSlot(running.team, running.runId, result.exitCode === 0 ? "completed" : "errored");
       runningSubagents.delete(running.id);
-      releaseAgentSlot(running.team, running.runId, result.exitCode === 0 ? "completed" : "errored");
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
@@ -1711,8 +1717,8 @@ async function watchSubagent(
     }
 
     closeSurface(surface);
+    await releaseAgentSlot(running.team, running.runId, result.exitCode === 0 && !result.errorMessage ? "completed" : "errored");
     runningSubagents.delete(running.id);
-    releaseAgentSlot(running.team, running.runId, result.exitCode === 0 && !result.errorMessage ? "completed" : "errored");
 
     return {
       name,
@@ -1742,8 +1748,8 @@ async function watchSubagent(
     try {
       closeSurface(surface);
     } catch {}
+    await releaseAgentSlot(running.team, running.runId, "errored");
     runningSubagents.delete(running.id);
-    releaseAgentSlot(running.team, running.runId, "errored");
     return {
       name,
       task,
@@ -1819,6 +1825,21 @@ function reconcileTeamWatchers(pi: ExtensionAPI, ctx: ExtensionContext): void {
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  const rootMailboxState: MailboxDeliveryState = { hops: 0, route: [] };
+  // Child delivery is owned by subagent-done.ts so it can carry hop provenance
+  // into subagent_message calls. The coordinator receives queued child mail here.
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (process.env.PI_SUBAGENT_RUN_ID || !ctx.sessionManager.getSessionFile()) return;
+    const team = getTeamContext(ctx);
+    await deliverMailboxAtTurnBoundary(
+      pi,
+      mailboxIdentityForContext(team),
+      rootMailboxState,
+      {},
+      ctx.sessionManager,
+    );
+  });
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
@@ -1854,6 +1875,52 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   );
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
+
+  // ── durable direct mailbox tool (root; children register it in subagent-done.ts) ──
+  if (!process.env.PI_SUBAGENT_RUN_ID && shouldRegister("subagent_message"))
+    pi.registerTool({
+      name: "subagent_message",
+      label: "Message Subagent",
+      description:
+        "Queue a durable direct message for another active agent in this subagent team. " +
+        "The message is delivered at the target's next agent-turn boundary and never wakes or starts an idle target.",
+      parameters: Type.Object({
+        target: Type.String({ description: "Recipient run ID, team path, or unique display name" }),
+        message: Type.String({ description: "Message to queue for the recipient" }),
+      }),
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        try {
+          const team = getTeamContext(ctx);
+          const queued = await enqueueMailboxMessage(
+            mailboxIdentityForContext(team),
+            params.target,
+            params.message,
+            { provenance: rootMailboxState },
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                `Message queued for ${queued.recipientName} (${queued.recipientPath}). ` +
+                "It will be delivered at that agent's next turn boundary without waking it.",
+            }],
+            details: {
+              id: queued.id,
+              sequence: queued.sequence,
+              targetRunId: queued.recipientRunId,
+              targetPath: queued.recipientPath,
+              status: "queued",
+            },
+          };
+        } catch (error) {
+          const message = (error as Error).message;
+          return {
+            content: [{ type: "text" as const, text: `Message was not queued: ${message}` }],
+            details: { error: message },
+          };
+        }
+      },
+    });
 
   // ── subagent tool ──
   if (shouldRegister("subagent"))
@@ -2576,9 +2643,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             try { closeSurface(surface); } catch {}
           }
           if (source) {
-            restoreAgentAfterFailedResume(team, source);
+            await restoreAgentAfterFailedResume(team, source);
           } else {
-            abandonAgentReservation(team, runId);
+            await abandonAgentReservation(team, runId);
           }
           const message = (error as any)?.message ?? String(error);
           return {

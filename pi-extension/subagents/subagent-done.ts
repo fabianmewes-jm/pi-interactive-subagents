@@ -8,6 +8,13 @@ import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  deliverMailboxAtTurnBoundary,
+  enqueueMailboxMessage,
+  mailboxIdentityFromEnvironment,
+  type MailboxDeliveryState,
+  type MailboxIdentity,
+} from "./mailbox.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -89,6 +96,13 @@ export default function (pi: ExtensionAPI) {
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  let mailboxIdentity: MailboxIdentity | null = null;
+  const mailboxState: MailboxDeliveryState = { hops: 0, route: [] };
+
+  function getMailboxIdentity(): MailboxIdentity {
+    mailboxIdentity ??= mailboxIdentityFromEnvironment();
+    return mailboxIdentity;
+  }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -162,8 +176,16 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", async (_event, ctx) => {
     recorder.beforeAgentStart();
+    if (!process.env.PI_SUBAGENT_TEAM_DIR) return;
+    await deliverMailboxAtTurnBoundary(
+      pi,
+      getMailboxIdentity(),
+      mailboxState,
+      {},
+      ctx.sessionManager,
+    );
   });
 
   pi.on("agent_start", () => {
@@ -297,6 +319,50 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: "Ping sent. Session will exit and parent will be notified." }],
         details: {},
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_message",
+    label: "Message Subagent",
+    description:
+      "Queue a durable direct message for another active agent in this subagent team. " +
+      "The message is delivered at the target's next agent-turn boundary and never wakes or starts an idle target. " +
+      "Targets may be an exact run ID, canonical or relative team path, unique display name, or root.",
+    parameters: Type.Object({
+      target: Type.String({ description: "Recipient run ID, team path, unique name, or root" }),
+      message: Type.String({ description: "Message to queue for the recipient" }),
+    }),
+    async execute(_toolCallId, params) {
+      try {
+        const queued = await enqueueMailboxMessage(
+          getMailboxIdentity(),
+          params.target,
+          params.message,
+          { provenance: mailboxState },
+        );
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              `Message queued for ${queued.recipientName} (${queued.recipientPath}). ` +
+              "It will be delivered at that agent's next turn boundary without waking it.",
+          }],
+          details: {
+            id: queued.id,
+            sequence: queued.sequence,
+            targetRunId: queued.recipientRunId,
+            targetPath: queued.recipientPath,
+            status: "queued",
+          },
+        };
+      } catch (error) {
+        const message = (error as Error).message;
+        return {
+          content: [{ type: "text" as const, text: `Message was not queued: ${message}` }],
+          details: { error: message },
+        };
+      }
     },
   });
 
