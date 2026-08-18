@@ -51,7 +51,7 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
@@ -1188,14 +1188,14 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
-      "read,bash,web_search,caller_ping,subagent_done",
+      "read,bash,web_search,caller_ping,subagent_message,subagent_done",
     );
   });
 
   it("buildSubagentToolAllowlist adds read when image paths require it", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("write,bash", true),
-      "write,bash,read,caller_ping,subagent_done",
+      "write,bash,read,caller_ping,subagent_message,subagent_done",
     );
   });
 
@@ -1493,6 +1493,23 @@ describe("tool registration", () => {
     assert.equal(denied.has("subagent"), true);
     assert.equal(denied.has("subagent_interrupt"), true);
     assert.equal(denied.has("subagent_resume"), true);
+    assert.equal(denied.has("subagent_message"), false);
+  });
+
+  it("registers subagent_message as a child control tool", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    subagentDoneExtension(api);
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+    assert.ok(messageTool);
+    assert.deepEqual(Object.keys(messageTool.parameters.properties).sort(), ["message", "target"]);
+  });
+
+  it("registers subagent_message for the root coordinator", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+    assert.ok(messageTool);
+    assert.deepEqual(Object.keys(messageTool.parameters.properties).sort(), ["message", "target"]);
   });
 
   it("renders partial subagent tool-call args without throwing", () => {

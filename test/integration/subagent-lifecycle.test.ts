@@ -18,7 +18,7 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   getAvailableBackends,
   setBackend,
@@ -33,6 +33,7 @@ import {
   uniqueId,
   trackTempFile,
   readScreen,
+  sendCommand,
   PI_TIMEOUT,
   type TestEnv,
 } from "./harness.ts";
@@ -193,6 +194,82 @@ for (const backend of backends) {
       assert.ok(contentA.includes(`DONE_A_${id}`), `File A should contain marker`);
       assert.ok(contentB.includes(`DONE_B_${id}`), `File B should contain marker`);
     });
+
+    // ── Durable direct mailbox (cmux-serialized) ──
+
+    if (backend === "cmux") {
+      it("queues Scout A mail for idle Worker B until Worker's next turn", async () => {
+        const id = uniqueId();
+        const readyFile = `/tmp/pi-integ-mailbox-ready-${id}.txt`;
+        const waitingGateFile = `/tmp/pi-integ-mailbox-waiting-${id}.txt`;
+        const infoFile = `/tmp/pi-integ-mailbox-info-${id}.txt`;
+        const queuedFile = `/tmp/pi-integ-mailbox-queued-${id}.txt`;
+        const deliveredFile = `/tmp/pi-integ-mailbox-delivered-${id}.txt`;
+        for (const file of [readyFile, waitingGateFile, infoFile, queuedFile, deliveredFile]) {
+          trackTempFile(env, file);
+        }
+
+        const surface = createTrackedSurface(env, `mailbox-${id}`);
+        await sleep(1000);
+
+        const workerTask = [
+          `Run this exact bash command first:`,
+          `printf '%s\\n%s\\n%s\\n%s\\n' "$PI_SUBAGENT_RUN_ID" "$PI_SUBAGENT_TEAM_DIR" "$PI_SUBAGENT_SURFACE" "$PI_SUBAGENT_ACTIVITY_FILE" > '${infoFile}'; echo 'READY_${id}' > '${readyFile}'`,
+          `Then finish your response and remain idle. Do not call subagent_done.`,
+          `On a later turn, obey any direct mailbox message delivered to you.`,
+        ].join("\n");
+        const scoutTask = [
+          `Run: while [ ! -f '${waitingGateFile}' ]; do sleep 1; done`,
+          `Then call subagent_message with target "Worker-${id}" and this exact message:`,
+          `Run: echo 'DELIVERED_${id}' > '${deliveredFile}'. Then call subagent_done.`,
+          `After subagent_message acknowledges the queue, run: echo 'QUEUED_${id}' > '${queuedFile}'`,
+          `Finally call subagent_done.`,
+        ].join("\n");
+        const task = [
+          `Call the subagent tool twice, without waiting for either result.`,
+          `First call: name "Worker-${id}", task ${JSON.stringify(workerTask)}, interactive true. Do not set agent.`,
+          `Second call: name "Scout-${id}", task ${JSON.stringify(scoutTask)}, interactive false. Do not set agent.`,
+          `After both calls, do not send any message to Worker and do not start or resume it.`,
+        ].join("\n");
+
+        startPi(surface, env.dir, task);
+        await waitForFile(readyFile, PI_TIMEOUT, /READY_/);
+        const info = await waitForFile(infoFile, PI_TIMEOUT);
+        const [workerRunId, teamDir, workerSurface, activityFile] = info.trim().split("\n");
+        assert.ok(
+          workerRunId && teamDir && workerSurface && activityFile,
+          `Invalid Worker mailbox metadata: ${info}`,
+        );
+
+        // READY is emitted inside the Worker tool call, before agent_end. Do
+        // not let Scout enqueue until both authoritative states report idle.
+        const waitingStarted = Date.now();
+        let observedWaiting = false;
+        while (Date.now() - waitingStarted < PI_TIMEOUT) {
+          try {
+            const agent = JSON.parse(readFileSync(`${teamDir}/agents/${workerRunId}.json`, "utf8"));
+            const activity = JSON.parse(readFileSync(activityFile, "utf8"));
+            if (agent.status === "waiting" && activity.phase === "waiting") {
+              observedWaiting = true;
+              break;
+            }
+          } catch {}
+          await sleep(200);
+        }
+        assert.equal(observedWaiting, true, "Worker must be authoritatively waiting before enqueue");
+        writeFileSync(waitingGateFile, `WAITING_${id}\n`);
+        await waitForFile(queuedFile, PI_TIMEOUT, /QUEUED_/);
+        assert.equal(existsSync(deliveredFile), false, "queued mail must not start an idle Worker turn");
+
+        const pendingDir = `${teamDir}/mailboxes/${workerRunId}/pending`;
+        assert.equal(readdirSync(pendingDir).filter((name) => name.endsWith(".json")).length, 1);
+
+        sendCommand(workerSurface, "Process the queued direct mailbox message now.");
+        const delivered = await waitForFile(deliveredFile, PI_TIMEOUT, /DELIVERED_/);
+        assert.match(delivered, new RegExp(`DELIVERED_${id}`));
+        assert.equal(readdirSync(pendingDir).filter((name) => name.endsWith(".json")).length, 0);
+      });
+    }
 
     // ── Fork mode ──
 

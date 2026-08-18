@@ -7,6 +7,7 @@ import {
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, normalize, resolve, sep } from "node:path";
@@ -79,6 +80,96 @@ export interface ReserveAgentInput {
 }
 
 const TERMINAL = new Set<TeamAgentStatus>(["completed", "errored"]);
+const MAILBOX_COMMIT_LOCK_TIMEOUT_MS = 2_000;
+const MAILBOX_COMMIT_STALE_MS = 30_000;
+const LIFECYCLE_COMMIT_LOCK_TIMEOUT_MS = 65_000;
+
+export interface TeamMailboxCommitLockOptions {
+  lockTimeoutMs?: number;
+  staleLockMs?: number;
+  lockPollMs?: number;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+function mailboxCommitLockPath(teamDir: string): string {
+  return join(teamDir, "mailboxes", ".commit.lock");
+}
+
+function tryAcquireMailboxCommitLock(
+  teamDir: string,
+  options: TeamMailboxCommitLockOptions = {},
+): (() => void) | null {
+  const path = mailboxCommitLockPath(teamDir);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+    throw error;
+  }
+  const token = randomUUID();
+  atomicWriteJson(join(path, "owner.json"), {
+    token,
+    pid: process.pid,
+    acquiredAt: (options.now ?? Date.now)(),
+  });
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (readJson<{ token?: string }>(join(path, "owner.json"))?.token !== token) return;
+    rmSync(path, { recursive: true, force: true });
+  };
+}
+
+export async function acquireTeamMailboxCommitLock(
+  teamDir: string,
+  options: TeamMailboxCommitLockOptions = {},
+): Promise<() => void> {
+  const clock = options.now ?? Date.now;
+  const started = clock();
+  const timeout = options.lockTimeoutMs ?? MAILBOX_COMMIT_LOCK_TIMEOUT_MS;
+  const staleAfter = options.staleLockMs ?? MAILBOX_COMMIT_STALE_MS;
+  const poll = options.lockPollMs ?? 10;
+  const path = mailboxCommitLockPath(teamDir);
+  const wait = options.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  for (;;) {
+    const release = tryAcquireMailboxCommitLock(teamDir, options);
+    if (release) return release;
+    try {
+      const age = clock() - statSync(path).mtimeMs;
+      const owner = readJson<{ pid?: number }>(join(path, "owner.json"));
+      const ownerIsDead = owner?.pid != null && !processAlive(owner.pid);
+      const invalidOwnerIsStale = owner?.pid == null && age >= staleAfter;
+      if (ownerIsDead || invalidOwnerIsStale) {
+        const stale = `${path}.stale.${process.pid}.${randomUUID()}`;
+        try {
+          renameSync(path, stale);
+          rmSync(stale, { recursive: true, force: true });
+          continue;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT" && code !== "EEXIST") throw error;
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      continue;
+    }
+    if (clock() - started >= timeout) {
+      throw new Error(`Mailbox commit lock timed out after ${timeout}ms.`);
+    }
+    await wait(Math.max(0, poll));
+  }
+}
+
+function acquireLifecycleMailboxCommitLock(teamDir: string): Promise<() => void> {
+  return acquireTeamMailboxCommitLock(teamDir, {
+    lockTimeoutMs: LIFECYCLE_COMMIT_LOCK_TIMEOUT_MS,
+    staleLockMs: MAILBOX_COMMIT_STALE_MS,
+  });
+}
 
 function atomicWriteJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -295,16 +386,24 @@ function recoverLeaseIfSafe(context: TeamContext, slot: number): boolean {
     // Only an unfinished reservation can be reclaimed from a dead reserving process.
     // Once marked active, pane/process liveness must be reconciled by the surface owner.
     if ((!agent || agent.status === "starting") && lease.phase !== "active" && !processAlive(lease.ownerPid ?? -1)) {
-      if (agent) {
-        atomicWriteJson(metadataPath(context.teamDir, agent.runId), {
-          ...agent,
-          status: "errored",
-          terminalAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        });
+      const commit = tryAcquireMailboxCommitLock(context.teamDir);
+      if (!commit) return false;
+      try {
+        const fresh = lease.runId ? readAgent(context, lease.runId) : null;
+        if (fresh && fresh.status !== "starting" && !TERMINAL.has(fresh.status)) return false;
+        if (fresh) {
+          atomicWriteJson(metadataPath(context.teamDir, fresh.runId), {
+            ...fresh,
+            status: "errored",
+            terminalAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+        rmSync(leaseDir(context.teamDir, slot), { recursive: true, force: true });
+        return true;
+      } finally {
+        commit();
       }
-      rmSync(leaseDir(context.teamDir, slot), { recursive: true, force: true });
-      return true;
     }
     return false;
   } finally {
@@ -372,7 +471,7 @@ export function readAgent(context: TeamContext, runId: string): TeamAgentRecord 
   return record?.teamId === context.teamId ? record : null;
 }
 
-export function updateAgent(
+function updateAgentRecord(
   context: TeamContext,
   runId: string,
   patch: Partial<Omit<TeamAgentRecord, "teamId" | "runId" | "version" | "createdAt">>,
@@ -400,39 +499,108 @@ export function updateAgent(
   return updated;
 }
 
+export function updateAgent(
+  context: TeamContext,
+  runId: string,
+  patch: Partial<Omit<TeamAgentRecord, "teamId" | "runId" | "version" | "createdAt">>,
+): TeamAgentRecord {
+  if (patch.status && TERMINAL.has(patch.status)) {
+    throw new Error("Terminal agent transitions must use releaseAgentSlot().");
+  }
+  return updateAgentRecord(context, runId, patch);
+}
+
 export function releaseAgentSlot(
   context: TeamContext,
   runId: string,
   status: "completed" | "errored" = "completed",
-): void {
-  const current = readAgent(context, runId);
-  if (!current || current.path === ROOT_AGENT_PATH) return;
-  const updated = updateAgent(context, runId, { status, terminalAt: new Date().toISOString() });
-  const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, updated.slot));
-  if (lease?.runId === runId) rmSync(leaseDir(context.teamDir, updated.slot), { recursive: true, force: true });
+): Promise<void> {
+  const transition = () => {
+    const current = readAgent(context, runId);
+    if (!current || current.path === ROOT_AGENT_PATH) return;
+    const updated = updateAgentRecord(context, runId, { status, terminalAt: new Date().toISOString() });
+    const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, updated.slot));
+    if (lease?.runId === runId) {
+      rmSync(leaseDir(context.teamDir, updated.slot), { recursive: true, force: true });
+    }
+  };
+  const immediate = tryAcquireMailboxCommitLock(context.teamDir);
+  if (immediate) {
+    try {
+      transition();
+    } finally {
+      immediate();
+    }
+    return Promise.resolve();
+  }
+  return acquireLifecycleMailboxCommitLock(context.teamDir).then((release) => {
+    try {
+      transition();
+    } finally {
+      release();
+    }
+  });
 }
 
-export function abandonAgentReservation(context: TeamContext, runId: string): void {
-  const current = readAgent(context, runId);
-  if (!current || current.path === ROOT_AGENT_PATH) return;
-  const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
-  if (lease?.runId === runId) rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
-  rmSync(metadataPath(context.teamDir, runId), { force: true });
+export function abandonAgentReservation(context: TeamContext, runId: string): Promise<void> {
+  const abandon = () => {
+    const current = readAgent(context, runId);
+    if (!current || current.path === ROOT_AGENT_PATH) return;
+    const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
+    if (lease?.runId === runId) {
+      rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
+    }
+    rmSync(metadataPath(context.teamDir, runId), { force: true });
+  };
+  const immediate = tryAcquireMailboxCommitLock(context.teamDir);
+  if (immediate) {
+    try {
+      abandon();
+    } finally {
+      immediate();
+    }
+    return Promise.resolve();
+  }
+  return acquireLifecycleMailboxCommitLock(context.teamDir).then((release) => {
+    try {
+      abandon();
+    } finally {
+      release();
+    }
+  });
 }
 
 /** Restore terminal metadata when a resume launch fails after reusing its run identity. */
 export function restoreAgentAfterFailedResume(
   context: TeamContext,
   previous: TeamAgentRecord,
-): void {
-  const current = readAgent(context, previous.runId);
-  if (current) {
-    const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
-    if (lease?.runId === previous.runId) {
-      rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
+): Promise<void> {
+  const restore = () => {
+    const current = readAgent(context, previous.runId);
+    if (current) {
+      const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
+      if (lease?.runId === previous.runId) {
+        rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
+      }
     }
+    atomicWriteJson(metadataPath(context.teamDir, previous.runId), previous);
+  };
+  const immediate = tryAcquireMailboxCommitLock(context.teamDir);
+  if (immediate) {
+    try {
+      restore();
+    } finally {
+      immediate();
+    }
+    return Promise.resolve();
   }
-  atomicWriteJson(metadataPath(context.teamDir, previous.runId), previous);
+  return acquireLifecycleMailboxCommitLock(context.teamDir).then((release) => {
+    try {
+      restore();
+    } finally {
+      release();
+    }
+  });
 }
 
 export function listTeamAgents(context: TeamContext, pathPrefix?: string): TeamAgentRecord[] {
@@ -461,6 +629,10 @@ export function resolveTeamTarget(context: TeamContext, target: string): TeamAge
   const value = target.trim();
   if (!value) throw new Error("Target must not be empty.");
   const agents = listTeamAgents(context);
+  if (value === "root") {
+    const root = agents.find((agent) => agent.path === ROOT_AGENT_PATH);
+    if (root) return root;
+  }
   const byId = agents.find((agent) => agent.runId === value);
   if (byId) return byId;
 
@@ -480,6 +652,24 @@ export function resolveTeamTarget(context: TeamContext, target: string): TeamAge
     throw new Error(`Ambiguous team target ${JSON.stringify(target)}; use an exact run ID or canonical path.`);
   }
   throw new Error(`Unknown team target: ${target}`);
+}
+
+/** Resolve an active, same-team direct-message target with self-send protection. */
+export function resolveTeamMessageTarget(
+  context: TeamContext,
+  target: string,
+  senderRunId: string,
+): TeamAgentRecord {
+  const recipient = resolveTeamTarget(context, target);
+  if (recipient.runId === senderRunId) {
+    throw new Error(`Cannot send a mailbox message to self (${recipient.path}).`);
+  }
+  if (TERMINAL.has(recipient.status)) {
+    throw new Error(
+      `Cannot send a mailbox message to terminal agent ${recipient.path} (${recipient.status}).`,
+    );
+  }
+  return recipient;
 }
 
 export function teamEnvironment(context: TeamContext, agent: TeamAgentRecord): Record<string, string> {
