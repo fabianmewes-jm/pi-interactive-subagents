@@ -81,15 +81,74 @@ export function appendImagePathInstructions(task: string, imagePaths: string[]):
   return `${task}\n\nImages attached to the current main-session user message are available at these absolute paths:\n${paths}\nRead the relevant image files with the read tool before completing the task.`;
 }
 
-function getForkContentLines(parentSessionFile: string): string[] {
+function parseLine(line: string): SessionEntry | null {
+  try {
+    return JSON.parse(line) as SessionEntry;
+  } catch {
+    return null;
+  }
+}
+
+function isUserMessage(entry: SessionEntry | null): boolean {
+  return entry?.type === "message" &&
+    (entry as Partial<MessageEntry>).message?.role === "user";
+}
+
+/**
+ * Copy the triggering turn's proven parent-id ancestry, optionally bounded
+ * to its latest N user turns.
+ * Entries on abandoned branches, or entries whose ancestry is missing, are
+ * deliberately not guessed into a bounded fork.
+ */
+function getAncestryForkContentLines(
+  lines: string[],
+  trigger: SessionEntry,
+  forkTurns: "all" | number,
+): string[] {
+  if (typeof trigger.parentId !== "string") return [];
+  const byId = new Map<string, { line: string; entry: SessionEntry }>();
+  for (const line of lines) {
+    const entry = parseLine(line);
+    if (entry?.type !== "session" && typeof entry?.id === "string") {
+      byId.set(entry.id, { line, entry });
+    }
+  }
+
+  const reverseChain: Array<{ line: string; entry: SessionEntry }> = [];
+  const visited = new Set<string>();
+  let parentId: string | undefined = trigger.parentId;
+  while (parentId && !visited.has(parentId)) {
+    visited.add(parentId);
+    const found = byId.get(parentId);
+    if (!found) break;
+    reverseChain.push(found);
+    parentId = typeof found.entry.parentId === "string" ? found.entry.parentId : undefined;
+  }
+
+  const chain = reverseChain.reverse();
+  if (forkTurns === "all") return chain.map((item) => item.line);
+
+  const userIndexes = chain
+    .map((item, index) => isUserMessage(item.entry) ? index : -1)
+    .filter((index) => index >= 0);
+  if (userIndexes.length === 0) return [];
+  const start = userIndexes[Math.max(0, userIndexes.length - forkTurns)];
+  return chain.slice(start).map((item, index) => {
+    if (index !== 0 || item.entry.parentId == null) return item.line;
+    const rebased = { ...item.entry, parentId: null };
+    return JSON.stringify(rebased);
+  });
+}
+
+function getForkContentLines(parentSessionFile: string, forkTurns: "all" | number): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
 
   let truncateAt = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type === "message" && entry.message?.role === "user") {
+      const entry = parseLine(lines[i]);
+      if (isUserMessage(entry)) {
         truncateAt = i;
         break;
       }
@@ -98,17 +157,16 @@ function getForkContentLines(parentSessionFile: string): string[] {
     }
   }
 
-  return lines.slice(0, truncateAt).filter((line) => {
-    try {
-      return JSON.parse(line).type !== "session";
-    } catch {
-      return true;
-    }
-  });
+  const trigger = parseLine(lines[truncateAt] ?? "");
+  return trigger
+    ? getAncestryForkContentLines(lines.slice(0, truncateAt), trigger, forkTurns)
+    : [];
 }
 
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
+  /** Defaults to all for backward-compatible full fork mode. */
+  forkTurns?: "all" | number;
   parentSessionFile: string;
   childSessionFile: string;
   childCwd: string;
@@ -122,7 +180,9 @@ export function seedSubagentSessionFile(params: {
     parentSession: params.parentSessionFile,
   };
   const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+    params.mode === "fork"
+      ? getForkContentLines(params.parentSessionFile, params.forkTurns ?? "all")
+      : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
