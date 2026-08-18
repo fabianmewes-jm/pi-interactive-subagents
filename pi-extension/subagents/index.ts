@@ -62,8 +62,11 @@ import {
   listTeamAgents,
   releaseAgentSlot,
   reserveAgentSlot,
+  restoreAgentAfterFailedResume,
   teamEnvironment,
   updateAgent,
+  type LaunchPolicy,
+  type TeamAgentRecord,
   type TeamContext,
 } from "./team.ts";
 import { loadTeamConfig } from "./config.ts";
@@ -112,6 +115,16 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  thinking: Type.Optional(
+    Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")], {
+      description: "Reasoning effort override (overrides agent frontmatter).",
+    }),
+  ),
+  taskName: Type.Optional(
+    Type.String({
+      description: "Stable task name used for the hierarchical team path. The display name is unchanged.",
+    }),
+  ),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -130,6 +143,12 @@ const SubagentParams = Type.Object({
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
     }),
   ),
+  forkTurns: Type.Optional(
+    Type.String({
+      description:
+        'Context to inherit: "none", "all", or a positive integer string for the latest N proven user turns.',
+    }),
+  ),
   interactive: Type.Optional(
     Type.Boolean({
       description:
@@ -146,11 +165,22 @@ const SubagentParams = Type.Object({
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
+type ThinkingLevel = "low" | "medium" | "high";
+type ForkTurns = "none" | "all" | number;
+
+interface EffectiveLaunchOptions {
+  model?: string;
+  thinking?: ThinkingLevel;
+  tools?: string;
+  skills?: string;
+}
+
 interface AgentDefaults {
   model?: string;
   tools?: string;
   skills?: string;
   thinking?: string;
+  taskName?: string;
   denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
@@ -210,6 +240,18 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   return denied;
 }
 
+function serializeDenyTools(denied: Set<string>): string {
+  return [...denied].sort().join(",");
+}
+
+function persistedDenyTools(policy: LaunchPolicy): string {
+  if (typeof policy.effectiveDenyTools === "string") return policy.effectiveDenyTools;
+  return serializeDenyTools(resolveDenyTools({
+    denyTools: typeof policy.denyTools === "string" ? policy.denyTools : undefined,
+    spawning: policy.spawning === false ? false : undefined,
+  }));
+}
+
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -256,6 +298,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
+    taskName: getFrontmatterValue(frontmatter, "task-name"),
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
@@ -319,11 +362,50 @@ function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
   return sessionDir;
 }
 
+function parseThinking(value: string | undefined, source: string): ThinkingLevel | undefined {
+  if (value == null) return undefined;
+  if (value === "low" || value === "medium" || value === "high") return value;
+  throw new Error(`Invalid ${source} thinking ${JSON.stringify(value)}; expected low, medium, or high.`);
+}
+
+function parseForkTurns(value: string): ForkTurns {
+  if (value === "none" || value === "all") return value;
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error(
+      `Invalid forkTurns ${JSON.stringify(value)}; expected "none", "all", or a positive integer string.`,
+    );
+  }
+  const turns = Number(value);
+  if (!Number.isSafeInteger(turns)) {
+    throw new Error(`Invalid forkTurns ${JSON.stringify(value)}; the positive integer is too large.`);
+  }
+  return turns;
+}
+
+function resolveForkTurns(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): ForkTurns | null {
+  const explicit = params.forkTurns != null ? parseForkTurns(params.forkTurns) : null;
+  if (params.fork === true && explicit != null && explicit !== "all") {
+    throw new Error(
+      `Conflicting context options: fork:true is an alias for forkTurns:"all", not ${JSON.stringify(params.forkTurns)}.`,
+    );
+  }
+  if (explicit != null) return explicit;
+  if (params.fork === true) return "all";
+  if (agentDefs?.sessionMode === "fork") return "all";
+  if (agentDefs?.sessionMode === "lineage-only") return "none";
+  return null;
+}
+
 function resolveEffectiveSessionMode(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): SubagentSessionMode {
-  if (params.fork) return "fork";
+  const forkTurns = resolveForkTurns(params, agentDefs);
+  if (forkTurns === "none") return "lineage-only";
+  if (forkTurns === "all" || typeof forkTurns === "number") return "fork";
   return agentDefs?.sessionMode ?? "standalone";
 }
 
@@ -333,16 +415,101 @@ function resolveLaunchBehavior(
 ): {
   sessionMode: SubagentSessionMode;
   seededSessionMode: "lineage-only" | "fork" | null;
+  forkTurns: "all" | number | null;
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
 } {
   const sessionMode = resolveEffectiveSessionMode(params, agentDefs);
+  const resolvedForkTurns = resolveForkTurns(params, agentDefs);
   const inheritsConversationContext = sessionMode === "fork";
   return {
     sessionMode,
     seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
+    forkTurns:
+      resolvedForkTurns === "all" || typeof resolvedForkTurns === "number"
+        ? resolvedForkTurns
+        : null,
     inheritsConversationContext,
     taskDelivery: inheritsConversationContext ? "direct" : "artifact",
+  };
+}
+
+function modelFromEnvironment(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const model = env.PI_MODEL?.trim();
+  if (!model) return undefined;
+  if (model.includes("/")) return model;
+  const provider = env.PI_PROVIDER?.trim();
+  return provider ? `${provider}/${model}` : undefined;
+}
+
+function thinkingFromEnvironment(env: NodeJS.ProcessEnv = process.env): ThinkingLevel | undefined {
+  const value = env.PI_REASONING_LEVEL?.trim();
+  return value === "low" || value === "medium" || value === "high" ? value : undefined;
+}
+
+function resolveEffectiveLaunchOptions(
+  params: Pick<Static<typeof SubagentParams>, "model" | "thinking" | "tools" | "skills">,
+  agentDefs: AgentDefaults | null,
+  env: NodeJS.ProcessEnv = process.env,
+): EffectiveLaunchOptions {
+  if (params.model != null && !params.model.trim()) {
+    throw new Error("Invalid tool model; expected a non-empty model name.");
+  }
+  const model = params.model?.trim() ?? agentDefs?.model ?? modelFromEnvironment(env);
+  const configuredThinking = params.thinking ?? agentDefs?.thinking;
+  const thinking = configuredThinking != null
+    ? parseThinking(configuredThinking, params.thinking != null ? "tool" : "agent frontmatter")
+    : model
+      ? thinkingFromEnvironment(env)
+      : undefined;
+  if (thinking && !model) {
+    throw new Error(
+      "A thinking override requires an effective model. Set model, agent frontmatter model, or PI_PROVIDER and PI_MODEL.",
+    );
+  }
+  const tools = params.tools ?? agentDefs?.tools;
+  const skills = params.skills ?? agentDefs?.skills;
+  return {
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+    ...(tools != null ? { tools } : {}),
+    ...(skills != null ? { skills } : {}),
+  };
+}
+
+function resolveTaskName(
+  params: Pick<Static<typeof SubagentParams>, "taskName">,
+  agentDefs: AgentDefaults | null,
+): string | undefined {
+  const value = params.taskName ?? agentDefs?.taskName;
+  if (value == null) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error("Invalid taskName; expected a non-empty task path name.");
+  return trimmed;
+}
+
+const REASONING_SUFFIX = /:(?:off|minimal|low|medium|high|xhigh)$/;
+
+function buildPiModelSpec(model: string | undefined, thinking: ThinkingLevel | undefined): string | undefined {
+  if (!model) return undefined;
+  if (!thinking) return model;
+  return `${model.replace(REASONING_SUFFIX, "")}:${thinking}`;
+}
+
+function modelEnvironment(model: string | undefined, thinking: ThinkingLevel | undefined): Record<string, string> {
+  const environment = {
+    PI_PROVIDER: "",
+    PI_MODEL: "",
+    PI_REASONING_LEVEL: thinking ?? "",
+  };
+  if (!model) return environment;
+  const normalizedModel = model.replace(REASONING_SUFFIX, "");
+  const slash = normalizedModel.indexOf("/");
+  if (slash <= 0 || slash === normalizedModel.length - 1) return environment;
+  return {
+    PI_PROVIDER: normalizedModel.slice(0, slash),
+    PI_MODEL: normalizedModel.slice(slash + 1),
+    PI_REASONING_LEVEL: thinking ?? "",
   };
 }
 
@@ -726,7 +893,7 @@ function buildSubagentToolAllowlist(effectiveTools?: string, requireRead = false
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
-  taskArg: string;
+  taskArg?: string;
 }): string[] {
   const skillPrompts = (params.effectiveSkills ?? "")
     .split(",")
@@ -734,12 +901,13 @@ function buildPiPromptArgs(params: {
     .filter(Boolean)
     .map((skill) => `/skill:${skill}`);
 
-  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
+  const needsSeparator =
+    params.taskArg != null && params.taskDelivery === "artifact" && skillPrompts.length > 0;
 
   return [
     ...(needsSeparator ? [""] : []),
     ...skillPrompts,
-    params.taskArg,
+    ...(params.taskArg != null ? [params.taskArg] : []),
   ];
 }
 
@@ -938,9 +1106,93 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
-function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
-  const autoExit = params.autoExit ?? true;
-  return { autoExit, interactive: !autoExit };
+interface ResumeOverrides {
+  name?: string;
+  autoExit?: boolean;
+  interactive?: boolean;
+  model?: string;
+  thinking?: string;
+  tools?: string;
+  skills?: string;
+  cwd?: string;
+}
+
+function findResumeSource(team: TeamContext, sessionPath: string): TeamAgentRecord | null {
+  return listTeamAgents(team)
+    .filter((agent) => agent.sessionPath === sessionPath)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0] ?? null;
+}
+
+function stringPolicy(policy: LaunchPolicy, key: string): string | undefined {
+  const value = policy[key];
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function resolveResumeLaunchBehavior(
+  params: ResumeOverrides,
+  source: TeamAgentRecord | null = null,
+  env: NodeJS.ProcessEnv = process.env,
+): {
+  name: string;
+  role?: string;
+  autoExit: boolean;
+  interactive: boolean;
+  model?: string;
+  thinking?: ThinkingLevel;
+  tools?: string;
+  skills?: string;
+  cwd?: string;
+  launchPolicy: LaunchPolicy;
+} {
+  const previous = source?.launchPolicy ?? {};
+  if (params.model != null && !params.model.trim()) {
+    throw new Error("Invalid resume model override; expected a non-empty model name.");
+  }
+  if (params.cwd != null && !params.cwd.trim()) {
+    throw new Error("Invalid resume cwd override; expected a non-empty path.");
+  }
+  if (params.name != null && !params.name.trim()) {
+    throw new Error("Invalid resume name override; expected a non-empty display name.");
+  }
+  const model = params.model?.trim() ?? stringPolicy(previous, "model") ?? modelFromEnvironment(env);
+  const configuredThinking = params.thinking ?? stringPolicy(previous, "thinking");
+  const thinking = configuredThinking != null
+    ? parseThinking(
+      configuredThinking,
+      params.thinking != null ? "resume override" : "stored launch policy",
+    )
+    : model
+      ? thinkingFromEnvironment(env)
+      : undefined;
+  if (thinking && !model) {
+    throw new Error(
+      "A resume thinking override requires an effective model. Set model or PI_PROVIDER and PI_MODEL.",
+    );
+  }
+  const storedAutoExit = typeof previous.autoExit === "boolean" ? previous.autoExit : undefined;
+  const autoExit = params.autoExit ?? storedAutoExit ?? true;
+  const storedInteractive = typeof previous.interactive === "boolean" ? previous.interactive : undefined;
+  const interactive = params.interactive ??
+    (params.autoExit != null ? !autoExit : storedInteractive ?? !autoExit);
+  const name = params.name?.trim() ?? source?.displayName ?? "Resume";
+  const role = source?.role ?? stringPolicy(previous, "agent");
+  const previousTools = typeof previous.tools === "string" ? previous.tools : undefined;
+  const previousSkills = typeof previous.skills === "string" ? previous.skills : undefined;
+  const tools = params.tools ?? previousTools;
+  const skills = params.skills ?? previousSkills;
+  const cwd = params.cwd?.trim() ?? stringPolicy(previous, "cwd");
+  const launchPolicy: LaunchPolicy = {
+    ...previous,
+    ...(model ? { model } : {}),
+    ...(thinking ? { thinking } : {}),
+    ...(tools != null ? { tools } : {}),
+    ...(skills != null ? { skills } : {}),
+    ...(cwd ? { cwd } : {}),
+    autoExit,
+    interactive,
+    effectiveDenyTools: persistedDenyTools(previous),
+  };
+  return { name, role, autoExit, interactive, model, thinking, tools, skills, cwd, launchPolicy };
 }
 
 export const __test__ = {
@@ -950,18 +1202,28 @@ export const __test__ = {
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
+  parseForkTurns,
+  resolveForkTurns,
   resolveLaunchBehavior,
+  resolveEffectiveLaunchOptions,
+  resolveTaskName,
+  buildPiModelSpec,
+  modelEnvironment,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
   resolveDenyTools,
+  serializeDenyTools,
+  persistedDenyTools,
+  thinkingFromEnvironment,
   resolveInterruptTarget,
   requestSubagentInterrupt,
   handleSubagentInterrupt,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  findResumeSource,
   runningSubagents,
   formatElapsed,
 };
@@ -999,11 +1261,16 @@ async function launchSubagent(
   const id = runId.slice(0, 8);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
-  const effectiveTools = params.tools ?? agentDefs?.tools;
-  const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effective = resolveEffectiveLaunchOptions(params, agentDefs);
+  const effectiveModel = effective.model;
+  const effectiveTools = effective.tools;
+  const effectiveSkills = effective.skills;
+  const effectiveThinking = effective.thinking;
+  const effectiveTaskName = resolveTaskName(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const effectiveDenyTools = resolveDenyTools(agentDefs);
+  const serializedDenyTools = serializeDenyTools(effectiveDenyTools);
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1034,10 +1301,14 @@ async function launchSubagent(
   const teamAgent = reserveAgentSlot(team, {
     runId,
     displayName: params.name,
+    taskName: effectiveTaskName,
     role: params.agent,
     sessionPath: subagentSessionFile,
     launchPolicy: {
       task: params.task,
+      taskName: effectiveTaskName,
+      sessionMode: launchBehavior.sessionMode,
+      forkTurns: launchBehavior.forkTurns,
       agent: params.agent,
       model: effectiveModel,
       thinking: effectiveThinking,
@@ -1045,7 +1316,14 @@ async function launchSubagent(
       skills: effectiveSkills,
       cwd: targetCwdForSession,
       interactive: effectiveInteractive,
+      autoExit: agentDefs?.autoExit,
       cli: agentDefs?.cli,
+      systemPrompt: params.systemPrompt,
+      identity: agentDefs?.body,
+      systemPromptMode: agentDefs?.systemPromptMode,
+      denyTools: agentDefs?.denyTools,
+      spawning: agentDefs?.spawning,
+      effectiveDenyTools: serializedDenyTools,
     },
   });
   let surface: string | undefined;
@@ -1059,11 +1337,10 @@ async function launchSubagent(
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
+      ...(launchBehavior.forkTurns != null ? { forkTurns: launchBehavior.forkTurns } : {}),
       parentSessionFile: sessionFile,
       childSessionFile: subagentSessionFile,
       childCwd: targetCwdForSession,
@@ -1083,7 +1360,6 @@ async function launchSubagent(
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-  const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1180,9 +1456,9 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
+  const piModelSpec = buildPiModelSpec(effectiveModel, effectiveThinking);
+  if (piModelSpec) {
+    parts.push("--model", shellEscape(piModelSpec));
   }
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
@@ -1211,6 +1487,10 @@ async function launchSubagent(
   // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
 
+  for (const [key, value] of Object.entries(modelEnvironment(effectiveModel, effectiveThinking))) {
+    envParts.push(`${key}=${shellEscape(value)}`);
+  }
+
   // If the target cwd has its own .pi/agent/, use that as the config root.
   // Otherwise propagate the current/global agent dir.
   if (localAgentDir && existsSync(localAgentDir)) {
@@ -1219,9 +1499,7 @@ async function launchSubagent(
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
   }
 
-  if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
-  }
+  envParts.push(`PI_DENY_TOOLS=${shellEscape(serializedDenyTools)}`);
   for (const [key, value] of Object.entries(teamEnvironment(team, teamAgent))) {
     envParts.push(`${key}=${shellEscape(value)}`);
   }
@@ -1953,7 +2231,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: Type.Object({
         sessionPath: Type.String({ description: "Path to the session .jsonl file to resume" }),
         name: Type.Optional(
-          Type.String({ description: "Display name for the terminal tab. Default: 'Resume'" }),
+          Type.String({ description: "Display name override. Defaults to the original subagent name, otherwise 'Resume'." }),
         ),
         message: Type.Optional(
           Type.String({
@@ -1963,9 +2241,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         autoExit: Type.Optional(
           Type.Boolean({
             description:
-              "Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
+              "Whether the resumed session should automatically exit after completing its response. Restores the original launch policy. Defaults to true when no stored policy exists.",
           }),
         ),
+        interactive: Type.Optional(
+          Type.Boolean({ description: "Override interactive tracking for this resumed run." }),
+        ),
+        model: Type.Optional(Type.String({ description: "Override the stored launch model." })),
+        thinking: Type.Optional(
+          Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")], {
+            description: "Override the stored reasoning effort.",
+          }),
+        ),
+        tools: Type.Optional(Type.String({ description: "Override the stored tool allowlist." })),
+        skills: Type.Optional(Type.String({ description: "Override the stored skills policy." })),
+        cwd: Type.Optional(Type.String({ description: "Override the stored working directory." })),
       }),
 
       renderCall(args, theme) {
@@ -1998,11 +2288,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const name = params.name ?? "Resume";
-        const { autoExit, interactive } = resolveResumeLaunchBehavior(params);
         const startTime = Date.now();
-        const runId = randomUUID();
-        const id = runId.slice(0, 8);
 
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
@@ -2020,12 +2306,47 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages.
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
         const team = getTeamContext(ctx);
-        const teamAgent = reserveAgentSlot(team, {
-          runId,
-          displayName: name,
-          sessionPath: params.sessionPath,
-          launchPolicy: { autoExit, interactive, task: params.message ?? "resumed session" },
-        });
+        const source = findResumeSource(team, params.sessionPath);
+        if (source && source.status !== "completed" && source.status !== "errored") {
+          return {
+            content: [{ type: "text" as const, text: `Subagent resume failed: ${source.path} is still ${source.status}.` }],
+            details: { error: "session is still active", runId: source.runId, path: source.path },
+          };
+        }
+        let restored: ReturnType<typeof resolveResumeLaunchBehavior>;
+        try {
+          restored = resolveResumeLaunchBehavior(params, source);
+        } catch (error) {
+          const message = (error as Error).message;
+          return {
+            content: [{ type: "text" as const, text: `Subagent resume failed: ${message}` }],
+            details: { error: message },
+          };
+        }
+        const { name, role, autoExit, interactive, model, thinking, tools, skills, cwd } = restored;
+        const runId = source?.runId ?? randomUUID();
+        const id = runId.slice(0, 8);
+        let teamAgent: TeamAgentRecord;
+        try {
+          teamAgent = reserveAgentSlot(team, {
+            runId,
+            displayName: name,
+            ...(source ? { path: source.path, parentPath: source.parentPath ?? team.agentPath } : {}),
+            ...(role ? { role } : {}),
+            sessionPath: params.sessionPath,
+            launchPolicy: {
+              ...restored.launchPolicy,
+              task: params.message ?? "resumed session",
+              resumedAt: new Date().toISOString(),
+            },
+          });
+        } catch (error) {
+          const message = (error as Error).message;
+          return {
+            content: [{ type: "text" as const, text: `Subagent resume failed: ${message}` }],
+            details: { error: message },
+          };
+        }
         let surface: string | undefined;
         try {
         surface = createSurface(name);
@@ -2038,10 +2359,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
 
+        const resumeModelSpec = buildPiModelSpec(model, thinking);
+        if (resumeModelSpec) parts.push("--model", shellEscape(resumeModelSpec));
+        const resumeToolAllowlist = buildSubagentToolAllowlist(tools);
+        if (resumeToolAllowlist) parts.push("--tools", shellEscape(resumeToolAllowlist));
+
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
+
+        const identity = stringPolicy(restored.launchPolicy, "identity") ??
+          stringPolicy(restored.launchPolicy, "systemPrompt");
+        const systemPromptMode = stringPolicy(restored.launchPolicy, "systemPromptMode");
+        if (identity && (systemPromptMode === "append" || systemPromptMode === "replace")) {
+          const syspromptPath = join(artifactDir, "subagent-resume", `${id}-sysprompt.md`);
+          mkdirSync(dirname(syspromptPath), { recursive: true });
+          writeFileSync(syspromptPath, identity, "utf8");
+          parts.push(
+            systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt",
+            shellEscape(syspromptPath),
+          );
+        }
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2058,18 +2397,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
+        }
+
+        for (const promptArg of buildPiPromptArgs({
+          effectiveSkills: skills,
+          taskDelivery: "artifact",
+          ...(resumeMsgFile ? { taskArg: `@${resumeMsgFile}` } : {}),
+        })) {
+          parts.push(shellEscape(promptArg));
         }
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
+        for (const [key, value] of Object.entries(modelEnvironment(model, thinking))) {
+          resumeEnvParts.push(`${key}=${shellEscape(value)}`);
+        }
         for (const [key, value] of Object.entries(teamEnvironment(team, teamAgent))) {
           resumeEnvParts.push(`${key}=${shellEscape(value)}`);
         }
-        if (process.env.PI_CODING_AGENT_DIR) {
+        const resumedLocalAgentDir = cwd ? join(cwd, ".pi", "agent") : null;
+        if (resumedLocalAgentDir && existsSync(resumedLocalAgentDir)) {
+          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumedLocalAgentDir)}`);
+        } else if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
+        resumeEnvParts.push(
+          `PI_DENY_TOOLS=${shellEscape(persistedDenyTools(restored.launchPolicy))}`,
+        );
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
+        if (role) resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(role)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
@@ -2078,7 +2434,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const resumeCdPrefix = cwd ? `cd ${shellEscape(cwd)} && ` : "";
+        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2117,6 +2474,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           team,
           name,
           task: params.message ?? "resumed session",
+          agent: role,
           surface,
           startTime,
           sessionFile: params.sessionPath,
@@ -2217,7 +2575,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           if (surface) {
             try { closeSurface(surface); } catch {}
           }
-          abandonAgentReservation(team, runId);
+          if (source) {
+            restoreAgentAfterFailedResume(team, source);
+          } else {
+            abandonAgentReservation(team, runId);
+          }
           const message = (error as any)?.message ?? String(error);
           return {
             content: [{ type: "text" as const, text: `Subagent resume failed: ${message}` }],

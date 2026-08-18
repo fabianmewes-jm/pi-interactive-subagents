@@ -1146,6 +1146,7 @@ describe("subagent discovery", () => {
     assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
       sessionMode: "standalone",
       seededSessionMode: null,
+      forkTurns: null,
       inheritsConversationContext: false,
       taskDelivery: "artifact",
     });
@@ -1154,6 +1155,7 @@ describe("subagent discovery", () => {
       {
         sessionMode: "lineage-only",
         seededSessionMode: "lineage-only",
+        forkTurns: null,
         inheritsConversationContext: false,
         taskDelivery: "artifact",
       },
@@ -1163,6 +1165,7 @@ describe("subagent discovery", () => {
       {
         sessionMode: "fork",
         seededSessionMode: "fork",
+        forkTurns: "all",
         inheritsConversationContext: true,
         taskDelivery: "direct",
       },
@@ -1175,6 +1178,7 @@ describe("subagent discovery", () => {
       {
         sessionMode: "fork",
         seededSessionMode: "fork",
+        forkTurns: "all",
         inheritsConversationContext: true,
         taskDelivery: "direct",
       },
@@ -1472,14 +1476,14 @@ describe("tool registration", () => {
   it("defaults resumed subagents to auto-exit and non-interactive tracking", () => {
     const testApi = (subagentsModule as any).__test__;
 
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({}), {
-      autoExit: true,
-      interactive: false,
-    });
-    assert.deepEqual(testApi.resolveResumeLaunchBehavior({ autoExit: false }), {
-      autoExit: false,
-      interactive: true,
-    });
+    const autonomous = testApi.resolveResumeLaunchBehavior({}, null, {});
+    assert.equal(autonomous.autoExit, true);
+    assert.equal(autonomous.interactive, false);
+    assert.equal(autonomous.name, "Resume");
+
+    const interactive = testApi.resolveResumeLaunchBehavior({ autoExit: false }, null, {});
+    assert.equal(interactive.autoExit, false);
+    assert.equal(interactive.interactive, true);
   });
 
   it("expands spawning false to deny subagent interruption", () => {
@@ -1497,6 +1501,9 @@ describe("tool registration", () => {
 
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
+    assert.ok(subagentTool.parameters.properties.thinking);
+    assert.ok(subagentTool.parameters.properties.taskName);
+    assert.ok(subagentTool.parameters.properties.forkTurns);
 
     const theme = {
       fg(_color: string, text: string) {

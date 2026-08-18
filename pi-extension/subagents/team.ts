@@ -65,6 +65,10 @@ export interface TeamContext {
 
 export interface ReserveAgentInput {
   displayName: string;
+  /** Optional stable path segment, separate from the user-facing display name. */
+  taskName?: string;
+  /** Reuse an existing canonical path when restoring a previous run. */
+  path?: string;
   role?: string;
   sessionPath: string;
   launchPolicy?: LaunchPolicy;
@@ -250,6 +254,25 @@ function canonicalChildPath(context: TeamContext, parentPath: string, name: stri
   return occupied.has(base) ? `${base}-${runId.slice(0, 8)}` : base;
 }
 
+function assertReusablePath(
+  context: TeamContext,
+  requestedPath: string,
+  runId: string,
+  parentPath: string,
+): string {
+  const path = normalize(requestedPath).replaceAll(sep, "/");
+  if (!path.startsWith(`${ROOT_AGENT_PATH}/`) || dirname(path) !== parentPath) {
+    throw new Error(`Invalid restored agent path ${JSON.stringify(requestedPath)} for parent ${parentPath}.`);
+  }
+  const occupied = listTeamAgents(context).find(
+    (agent) => agent.path === path && agent.runId !== runId && !TERMINAL.has(agent.status),
+  );
+  if (occupied) {
+    throw new Error(`Cannot restore agent path ${path}; it is currently used by ${occupied.runId}.`);
+  }
+  return path;
+}
+
 function recoverLeaseIfSafe(context: TeamContext, slot: number): boolean {
   const recoveryLock = join(context.teamDir, "leases", `${slot}.recovery`);
   try {
@@ -296,6 +319,10 @@ export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput)
   const ownerPid = input.ownerPid ?? process.pid;
   const parentPath = input.parentPath ?? context.agentPath;
   const now = (input.now ?? new Date()).toISOString();
+  const previousRecord = readAgent(context, runId);
+  if (previousRecord && !TERMINAL.has(previousRecord.status)) {
+    throw new Error(`Cannot reuse active agent identity ${runId} (${previousRecord.status}).`);
+  }
 
   for (let slot = 1; slot < context.threadCap; slot += 1) {
     const leaseOwner = { runId, ownerPid, phase: "reserved" as const, updatedAt: now };
@@ -308,7 +335,9 @@ export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput)
         version: 1,
         teamId: context.teamId,
         runId,
-        path: canonicalChildPath(context, parentPath, input.displayName, runId),
+        path: input.path
+          ? assertReusablePath(context, input.path, runId, parentPath)
+          : canonicalChildPath(context, parentPath, input.taskName ?? input.displayName, runId),
         parentPath,
         displayName: input.displayName,
         ...(input.role ? { role: input.role } : {}),
@@ -316,7 +345,7 @@ export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput)
         status: "starting",
         slot,
         ownerPid,
-        createdAt: now,
+        createdAt: previousRecord?.createdAt ?? now,
         updatedAt: now,
         launchPolicy: input.launchPolicy ?? {},
       };
@@ -324,7 +353,11 @@ export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput)
       return record;
     } catch (error) {
       rmSync(leaseDir(context.teamDir, slot), { recursive: true, force: true });
-      rmSync(metadataPath(context.teamDir, runId), { force: true });
+      if (previousRecord) {
+        atomicWriteJson(metadataPath(context.teamDir, runId), previousRecord);
+      } else {
+        rmSync(metadataPath(context.teamDir, runId), { force: true });
+      }
       throw error;
     }
   }
@@ -385,6 +418,21 @@ export function abandonAgentReservation(context: TeamContext, runId: string): vo
   const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
   if (lease?.runId === runId) rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
   rmSync(metadataPath(context.teamDir, runId), { force: true });
+}
+
+/** Restore terminal metadata when a resume launch fails after reusing its run identity. */
+export function restoreAgentAfterFailedResume(
+  context: TeamContext,
+  previous: TeamAgentRecord,
+): void {
+  const current = readAgent(context, previous.runId);
+  if (current) {
+    const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
+    if (lease?.runId === previous.runId) {
+      rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
+    }
+  }
+  atomicWriteJson(metadataPath(context.teamDir, previous.runId), previous);
 }
 
 export function listTeamAgents(context: TeamContext, pathPrefix?: string): TeamAgentRecord[] {
