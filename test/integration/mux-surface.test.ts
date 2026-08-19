@@ -14,17 +14,22 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
 import {
+  captureCmuxFocusSnapshot,
+  closeOwnedMuxTarget,
+  isStableCmuxId,
+  muxInstanceIdentity,
+  pollForExit,
+  surfaceExists,
+} from "../../pi-extension/subagents/cmux.ts";
+import {
   getAvailableBackends,
   setBackend,
   restoreBackend,
   createTestEnv,
-  cleanupTestEnv,
+  cleanupTestEnvVerified,
+  snapshotCmuxSurfaces,
+  trackRegistryOwnedSurfaces,
   createTrackedSurface,
-  createTrackedSurfaceSplit,
-  focusSurface,
-  getFocusedSurface,
-  getSurfacePane,
-  waitForFocusedSurface,
   untrackSurface,
   sendCommand,
   sendLongCommand,
@@ -41,8 +46,6 @@ import {
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
-const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
-
 if (backends.length === 0) {
   console.log("⚠️  No mux backend available — skipping mux-surface integration tests");
   console.log("   Run inside cmux or tmux to enable these tests.");
@@ -52,53 +55,53 @@ for (const backend of backends) {
   describe(`mux-surface [${backend}]`, { timeout: 60_000 }, () => {
     let prevMux: string | undefined;
     let env: TestEnv;
+    let suiteBaseline: ReturnType<typeof snapshotCmuxSurfaces> = null;
+    const suiteOwned = new Map<string, string>();
 
     before(() => {
       prevMux = setBackend(backend);
-      env = createTestEnv(backend);
+      suiteBaseline = backend === "cmux" ? snapshotCmuxSurfaces() : null;
     });
 
     after(() => {
-      cleanupTestEnv(env);
-      restoreBackend(prevMux);
-    });
-
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
-      const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
-      await sleep(1000);
-
-      focusSurface(backend, anchor);
-      await waitForFocusedSurface(backend, anchor, 10_000);
-
-      const childA = createTrackedSurface(env, "focus-child-a");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(backend), anchor);
-
-      const childB = createTrackedSurface(env, "focus-child-b");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(backend), anchor);
-
-      if (backend === "cmux") {
-        const paneA = getSurfacePane(backend, childA);
-        const paneB = getSurfacePane(backend, childB);
-        assert.ok(paneA, `Expected pane ref for ${childA}`);
-        assert.ok(paneB, `Expected pane ref for ${childB}`);
-        assert.equal(paneB, paneA);
+      try {
+        if (backend !== "cmux") return;
+        assert.ok(suiteBaseline, "cmux mux-surface baseline snapshot must succeed");
+        const current = snapshotCmuxSurfaces();
+        assert.ok(current, "cmux mux-surface postcondition snapshot must succeed");
+        const remaining = current.filter((surface) => suiteOwned.has(surface.ref));
+        const evidence = [...suiteOwned].map(([ref, title]) => `${ref} ${JSON.stringify(title)}`);
+        console.log(`cmux mux-surface owned surfaces (${evidence.length}): ${evidence.join(", ") || "none"}`);
+        assert.deepEqual(
+          remaining,
+          [],
+          `cmux mux-surface suite leaked owned surfaces: ${remaining.map((surface) => `${surface.ref} ${JSON.stringify(surface.title)}`).join(", ")}`,
+        );
+      } finally {
+        restoreBackend(prevMux);
       }
-
-      const markerA = uniqueId();
-      const markerB = uniqueId();
-      sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
-      sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
-
-      await Promise.all([
-        waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
-        waitForScreen(childB, new RegExp(`FOCUS_B_${markerB}`), 20_000, 50),
-      ]);
-      assert.equal(getFocusedSurface(backend), anchor);
     });
 
-    it("creates a surface, sends a command, reads output, and closes it", async () => {
+    const scenarioIt = (name: string, run: () => Promise<void>) => it(name, async () => {
+      env = createTestEnv(backend);
+      try {
+        await run();
+      } finally {
+        trackRegistryOwnedSurfaces(env);
+        for (const tracked of env.surfaceHistory) {
+          if (backend !== "cmux") continue;
+          assert.equal(
+            suiteBaseline?.some((surface) => surface.ref === tracked.ref),
+            false,
+            `owned UUID unexpectedly predates mux-surface suite: ${tracked.ref}`,
+          );
+          suiteOwned.set(tracked.ref, tracked.cmuxOwnership?.titleFragment ?? "unlabeled");
+        }
+        await cleanupTestEnvVerified(env);
+      }
+    });
+
+    scenarioIt("creates a surface, sends a command, reads output, and closes it", async () => {
       const surface = createTrackedSurface(env, "echo-test");
       await sleep(1000);
 
@@ -116,7 +119,72 @@ for (const backend of backends) {
       untrackSurface(env, surface);
     });
 
-    it("preserves shell special characters in echo output", async () => {
+    if (backend === "cmux") {
+    scenarioIt("reconciles an externally closed exact cmux UUID without touching another surface", async () => {
+      const owned = createTrackedSurface(env, "external-close-owned");
+      const unrelated = createTrackedSurface(env, "external-close-unrelated");
+      assert.equal(isStableCmuxId(owned), true);
+      assert.equal(isStableCmuxId(unrelated), true);
+      await sleep(1000);
+
+      closeSurface(owned);
+      untrackSurface(env, owned);
+      const result = await pollForExit(owned, new AbortController().signal, {
+        interval: 10,
+        surfaceExists,
+      });
+      assert.equal(result.reason, "disappeared");
+      assert.equal(surfaceExists(unrelated), true);
+      sendCommand(unrelated, "echo UNRELATED_SURVIVED");
+      await waitForScreen(unrelated, /UNRELATED_SURVIVED/, 10_000, 30);
+    });
+
+    scenarioIt("closes a recorded cmux target through its proven instance only", async () => {
+      const owned = createTrackedSurface(env, "owned-instance-close");
+      const unrelated = createTrackedSurface(env, "owned-instance-unrelated");
+      const instanceId = muxInstanceIdentity("cmux");
+      assert.ok(instanceId);
+
+      closeOwnedMuxTarget({ backend: "cmux", id: owned, instanceId });
+      untrackSurface(env, owned);
+      assert.equal(surfaceExists(owned), false);
+      assert.equal(surfaceExists(unrelated), true);
+    });
+
+    scenarioIt("keeps the current stable cmux context unchanged for background lifecycle operations", async () => {
+      const stable = () => {
+        const snapshot = captureCmuxFocusSnapshot();
+        assert.ok(snapshot?.windowId && snapshot.workspaceId && snapshot.paneId && snapshot.surfaceId);
+        return {
+          windowId: snapshot.windowId,
+          workspaceId: snapshot.workspaceId,
+          paneId: snapshot.paneId,
+          surfaceId: snapshot.surfaceId,
+        };
+      };
+      const before = stable();
+      const target = createTrackedSurface(env, "focus-neutral-lifecycle");
+      assert.deepEqual(stable(), before);
+
+      sendCommand(target, "printf FOCUS_NEUTRAL");
+      assert.deepEqual(stable(), before);
+      readScreen(target, 5);
+      assert.deepEqual(stable(), before);
+      await readScreenAsync(target, 5);
+      assert.deepEqual(stable(), before);
+      sendEscape(target);
+      assert.deepEqual(stable(), before);
+
+      const instanceId = muxInstanceIdentity("cmux");
+      assert.ok(instanceId);
+      closeOwnedMuxTarget({ backend: "cmux", id: target, instanceId });
+      untrackSurface(env, target);
+      assert.deepEqual(stable(), before);
+    });
+
+    }
+
+    scenarioIt("preserves shell special characters in echo output", async () => {
       const surface = createTrackedSurface(env, "escape-test");
       await sleep(1000);
 
@@ -137,7 +205,7 @@ for (const backend of backends) {
       );
     });
 
-    it("sends a long command via script file without truncation", async () => {
+    scenarioIt("sends a long command via script file without truncation", async () => {
       const surface = createTrackedSurface(env, "long-cmd-test");
       await sleep(1000);
 
@@ -159,7 +227,7 @@ for (const backend of backends) {
       );
     });
 
-    it("reads screen asynchronously", async () => {
+    scenarioIt("reads screen asynchronously", async () => {
       const surface = createTrackedSurface(env, "async-read-test");
       await sleep(1000);
 
@@ -174,7 +242,7 @@ for (const backend of backends) {
       );
     });
 
-    it("manages multiple surfaces concurrently", async () => {
+    scenarioIt("manages multiple surfaces concurrently", async () => {
       const s1 = createTrackedSurface(env, "multi-1");
       const s2 = createTrackedSurface(env, "multi-2");
       await sleep(1500);
@@ -192,7 +260,7 @@ for (const backend of backends) {
       assert.ok(screen2.includes(`S2_${m2}`), `Surface 2 missing marker. Got:\n${screen2}`);
     });
 
-    it("writes output to a file and verifies via surface", async () => {
+    scenarioIt("writes output to a file and verifies via surface", async () => {
       const surface = createTrackedSurface(env, "file-test");
       await sleep(1000);
 
@@ -211,7 +279,7 @@ for (const backend of backends) {
       } catch {}
     });
 
-    it("delivers Escape as byte 27 to the target surface", async () => {
+    scenarioIt("delivers Escape as byte 27 to the target surface", async () => {
       const surface = createTrackedSurface(env, "escape-byte-test");
       await sleep(1000);
 

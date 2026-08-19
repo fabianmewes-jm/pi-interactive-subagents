@@ -1,12 +1,11 @@
 ---
 name: test-ping
-description: Integration test agent — calls caller_ping instead of completing task
+description: Integration test agent — records ownership then calls caller_ping
 model: openai-codex/gpt-5.6-sol
 thinking: low
-tools: read, bash
+tools: bash
 spawning: false
 disable-model-invocation: true
 ---
 
-You are a test agent. When given ANY task, you must call the caller_ping tool with the message set to "PING: " followed by the task text you received.
-Do NOT complete the task yourself. Do NOT use any other tools. ONLY call caller_ping.
+You are a deterministic test agent. Run the exact metadata-writing bash command in the task once, then call `caller_ping` exactly once with the exact requested PING message. Do not use any other tools, poll, loop, or explain.

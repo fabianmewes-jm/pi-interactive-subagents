@@ -8,6 +8,13 @@ const execFileAsync = promisify(execFile);
 
 export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
 
+export interface OwnedMuxTarget {
+  backend: MuxBackend;
+  id: string;
+  instanceId?: string;
+  runtimeInstanceId?: string;
+}
+
 const commandAvailability = new Map<string, boolean>();
 
 function hasCommand(command: string): boolean {
@@ -91,6 +98,27 @@ export function getMuxBackend(): MuxBackend | null {
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
   return null;
+}
+
+export function muxInstanceIdentity(
+  backend: MuxBackend,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (backend === "cmux") return env.CMUX_SOCKET_PATH || null;
+  if (backend === "tmux") return env.TMUX || null;
+  if (backend === "zellij") return env.ZELLIJ_SESSION_NAME || null;
+  return env.WEZTERM_UNIX_SOCKET || null;
+}
+
+export function ownedMuxTargetIsTrusted(
+  target: OwnedMuxTarget,
+  env: NodeJS.ProcessEnv = process.env,
+  runtimeInstanceId?: string,
+): boolean {
+  const current = muxInstanceIdentity(target.backend, env);
+  if (!target.instanceId || !current || target.instanceId !== current) return false;
+  if (target.backend === "cmux") return true;
+  return !!runtimeInstanceId && target.runtimeInstanceId === runtimeInstanceId;
 }
 
 export function isMuxAvailable(): boolean {
@@ -527,13 +555,20 @@ function createZellijSurface(name: string): string {
   return withZellijSurfaceLock(() => createZellijSurfaceUnlocked(name));
 }
 
-type CmuxFocusSnapshot = {
+export type CmuxFocusSnapshot = {
   surfaceRef?: string;
+  surfaceId?: string;
   paneRef?: string;
+  paneId?: string;
+  workspaceId?: string;
+  windowId?: string;
 };
 
-type CmuxCreatedSurface = {
+export type CmuxCreatedSurface = {
+  /** Stable UUID used for every production operation. */
   surface: string;
+  surfaceRef: string;
+  paneId?: string;
   paneRef?: string;
 };
 
@@ -552,12 +587,30 @@ export function parseCmuxFocusedSnapshot(value: unknown): CmuxFocusSnapshot | nu
   const focused = (value as { focused?: unknown }).focused;
   if (!focused || typeof focused !== "object") return null;
 
-  const record = focused as { surface_ref?: unknown; pane_ref?: unknown };
+  const record = focused as {
+    surface_ref?: unknown;
+    surface_id?: unknown;
+    pane_ref?: unknown;
+    pane_id?: unknown;
+    workspace_id?: unknown;
+    window_id?: unknown;
+  };
   const surfaceRef = nonEmptyString(record.surface_ref) ? record.surface_ref : undefined;
+  const surfaceId = nonEmptyString(record.surface_id) ? record.surface_id : undefined;
   const paneRef = nonEmptyString(record.pane_ref) ? record.pane_ref : undefined;
+  const paneId = nonEmptyString(record.pane_id) ? record.pane_id : undefined;
+  const workspaceId = nonEmptyString(record.workspace_id) ? record.workspace_id : undefined;
+  const windowId = nonEmptyString(record.window_id) ? record.window_id : undefined;
 
-  if (!surfaceRef && !paneRef) return null;
-  return { surfaceRef, paneRef };
+  if (!surfaceRef && !surfaceId && !paneRef && !paneId && !workspaceId && !windowId) return null;
+  return {
+    ...(surfaceRef ? { surfaceRef } : {}),
+    ...(surfaceId ? { surfaceId } : {}),
+    ...(paneRef ? { paneRef } : {}),
+    ...(paneId ? { paneId } : {}),
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(windowId ? { windowId } : {}),
+  };
 }
 
 export function parseCmuxJson(value: string): unknown | null {
@@ -573,32 +626,65 @@ export function parseCmuxFocusedSnapshotFromJson(value: string): CmuxFocusSnapsh
   return parseCmuxFocusedSnapshot(parseCmuxJson(value));
 }
 
-function parseCmuxCallerSnapshot(value: unknown): CmuxFocusSnapshot | null {
+export function parseCmuxCallerSnapshot(value: unknown): CmuxFocusSnapshot | null {
   if (!value || typeof value !== "object") return null;
 
   const caller = (value as { caller?: unknown }).caller;
   if (!caller || typeof caller !== "object") return null;
 
-  const record = caller as { surface_ref?: unknown; pane_ref?: unknown };
+  const record = caller as {
+    surface_ref?: unknown;
+    surface_id?: unknown;
+    pane_ref?: unknown;
+    pane_id?: unknown;
+    workspace_id?: unknown;
+    window_id?: unknown;
+  };
   const surfaceRef = nonEmptyString(record.surface_ref) ? record.surface_ref : undefined;
+  const surfaceId = nonEmptyString(record.surface_id) ? record.surface_id : undefined;
   const paneRef = nonEmptyString(record.pane_ref) ? record.pane_ref : undefined;
+  const paneId = nonEmptyString(record.pane_id) ? record.pane_id : undefined;
+  const workspaceId = nonEmptyString(record.workspace_id) ? record.workspace_id : undefined;
+  const windowId = nonEmptyString(record.window_id) ? record.window_id : undefined;
 
-  if (!surfaceRef && !paneRef) return null;
-  return { surfaceRef, paneRef };
+  if (!surfaceRef && !surfaceId && !paneRef && !paneId && !workspaceId && !windowId) return null;
+  return {
+    ...(surfaceRef ? { surfaceRef } : {}),
+    ...(surfaceId ? { surfaceId } : {}),
+    ...(paneRef ? { paneRef } : {}),
+    ...(paneId ? { paneId } : {}),
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(windowId ? { windowId } : {}),
+  };
 }
 
 export function parseCmuxPaneRefForSurface(value: unknown, surface: string): string | null {
   if (!value || typeof value !== "object") return null;
 
-  const record = value as { surface_ref?: unknown; pane_ref?: unknown; caller?: unknown };
-  if (record.surface_ref === surface && nonEmptyString(record.pane_ref)) return record.pane_ref;
+  const record = value as {
+    surface_ref?: unknown;
+    surface_id?: unknown;
+    pane_ref?: unknown;
+    pane_id?: unknown;
+    caller?: unknown;
+  };
+  if (record.surface_ref === surface || record.surface_id === surface) {
+    if (nonEmptyString(record.pane_id)) return record.pane_id;
+    if (nonEmptyString(record.pane_ref)) return record.pane_ref;
+  }
 
   const caller = record.caller;
   if (!caller || typeof caller !== "object") return null;
 
-  const callerRecord = caller as { surface_ref?: unknown; pane_ref?: unknown };
-  if (callerRecord.surface_ref === surface && nonEmptyString(callerRecord.pane_ref)) {
-    return callerRecord.pane_ref;
+  const callerRecord = caller as {
+    surface_ref?: unknown;
+    surface_id?: unknown;
+    pane_ref?: unknown;
+    pane_id?: unknown;
+  };
+  if (callerRecord.surface_ref === surface || callerRecord.surface_id === surface) {
+    if (nonEmptyString(callerRecord.pane_id)) return callerRecord.pane_id;
+    if (nonEmptyString(callerRecord.pane_ref)) return callerRecord.pane_ref;
   }
 
   return null;
@@ -623,87 +709,116 @@ function parseCmuxIdentifySnapshot(value: string | null): CmuxIdentifySnapshot {
 }
 
 function captureCmuxIdentifySnapshot(): CmuxIdentifySnapshot {
-  return parseCmuxIdentifySnapshot(readCmux(["identify", "--json"]));
+  return parseCmuxIdentifySnapshot(readCmux(["--json", "--id-format", "both", "identify"]));
 }
 
-function captureCmuxFocusSnapshot(): CmuxFocusSnapshot | null {
+export function captureCmuxFocusSnapshot(): CmuxFocusSnapshot | null {
   return captureCmuxIdentifySnapshot().focused;
 }
 
+export function captureCmuxSurfaceSnapshot(surface: string): CmuxFocusSnapshot | null {
+  const raw = readCmux(["--json", "--id-format", "both", "identify", "--surface", surface]);
+  if (!raw) return null;
+  const target = parseCmuxCallerSnapshot(parseCmuxJson(raw));
+  if (!isStableCmuxFocusSnapshot(target)) return null;
+  return !isStableCmuxId(surface) || sameCmuxIdentity(target.surfaceId, surface) ? target : null;
+}
+
 function readCmuxPaneRefForSurface(surface: string): string | null {
-  const info = readCmux(["identify", "--surface", surface]);
+  const info = readCmux(["--json", "--id-format", "both", "identify", "--surface", surface]);
   return info ? parseCmuxPaneRefForSurfaceFromJson(info, surface) : null;
 }
 
-function restoreCmuxFocusSnapshot(snapshot: CmuxFocusSnapshot | null): void {
-  if (!snapshot) return;
-
-  if (snapshot.paneRef) {
-    spawnSync("cmux", ["focus-pane", "--pane", snapshot.paneRef], { encoding: "utf8" });
-  }
-
-  if (snapshot.surfaceRef) {
-    spawnSync("cmux", ["focus-panel", "--panel", snapshot.surfaceRef], { encoding: "utf8" });
-  }
+function isStableCmuxFocusSnapshot(snapshot: CmuxFocusSnapshot | null): snapshot is CmuxFocusSnapshot & {
+  surfaceId: string;
+  paneId: string;
+  workspaceId: string;
+  windowId: string;
+} {
+  return !!snapshot && isStableCmuxId(snapshot.surfaceId ?? "") &&
+    isStableCmuxId(snapshot.paneId ?? "") &&
+    isStableCmuxId(snapshot.workspaceId ?? "") &&
+    isStableCmuxId(snapshot.windowId ?? "");
 }
 
-function waitForCmuxFocusSettle(): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-}
-
-function cmuxFocusMatchesChild(
-  currentFocus: CmuxFocusSnapshot | null,
-  child: CmuxCreatedSurface,
+export function isExactCmuxSurfaceFocused(
+  current: CmuxFocusSnapshot | null,
+  target: CmuxFocusSnapshot | null,
 ): boolean {
-  if (!currentFocus) return false;
-  if (currentFocus.surfaceRef === child.surface) return true;
-  return !!currentFocus.paneRef && currentFocus.paneRef === child.paneRef;
+  return isStableCmuxFocusSnapshot(current) && isStableCmuxFocusSnapshot(target) &&
+    sameCmuxIdentity(current.surfaceId, target.surfaceId);
 }
 
-function cmuxFocusMatchesSurfaceRef(
-  currentFocus: CmuxFocusSnapshot | null,
-  surfaceRef: string | undefined,
+export function shouldRestoreCmuxFocus(
+  before: CmuxFocusSnapshot | null,
+  after: CmuxFocusSnapshot | null,
+  target: CmuxFocusSnapshot | null,
 ): boolean {
-  return !!surfaceRef && currentFocus?.surfaceRef === surfaceRef;
-}
-
-function cmuxFocusMatchesPaneRef(
-  currentFocus: CmuxFocusSnapshot | null,
-  paneRef: string | undefined,
-): boolean {
-  return !!paneRef && currentFocus?.paneRef === paneRef;
-}
-
-function restoreCmuxFocusIfLaunchSurfaceFocused(
-  snapshot: CmuxFocusSnapshot | null,
-  child: CmuxCreatedSurface,
-  options?: { sourceSurfaceRef?: string; callerSnapshot?: CmuxFocusSnapshot | null },
-): void {
-  if (!snapshot) return;
-
-  waitForCmuxFocusSettle();
-  const currentFocus = captureCmuxFocusSnapshot();
   if (
-    cmuxFocusMatchesChild(currentFocus, child) ||
-    cmuxFocusMatchesSurfaceRef(currentFocus, options?.sourceSurfaceRef) ||
-    cmuxFocusMatchesSurfaceRef(currentFocus, options?.callerSnapshot?.surfaceRef) ||
-    // cmux can settle focus onto another active surface in the caller pane after creating a split/surface.
-    cmuxFocusMatchesPaneRef(currentFocus, options?.callerSnapshot?.paneRef)
-  ) {
-    restoreCmuxFocusSnapshot(snapshot);
+    !isStableCmuxFocusSnapshot(before) ||
+    !isStableCmuxFocusSnapshot(after) ||
+    !isStableCmuxFocusSnapshot(target)
+  ) return false;
+  if (sameCmuxFocus(before, after)) return false;
+  return sameCmuxIdentity(after.surfaceId, target.surfaceId);
+}
+
+function sameCmuxFocus(left: CmuxFocusSnapshot, right: CmuxFocusSnapshot): boolean {
+  return sameCmuxIdentity(left.windowId, right.windowId) &&
+    sameCmuxIdentity(left.workspaceId, right.workspaceId) &&
+    sameCmuxIdentity(left.paneId, right.paneId) &&
+    sameCmuxIdentity(left.surfaceId, right.surfaceId);
+}
+
+function restoreCmuxFocusSnapshot(snapshot: CmuxFocusSnapshot | null): void {
+  if (!isStableCmuxFocusSnapshot(snapshot)) return;
+  execFileSync("cmux", ["focus-window", "--window", snapshot.windowId], { encoding: "utf8" });
+  execFileSync("cmux", [
+    "select-workspace", "--window", snapshot.windowId, "--workspace", snapshot.workspaceId,
+  ], { encoding: "utf8" });
+  execFileSync("cmux", [
+    "focus-pane", "--window", snapshot.windowId, "--workspace", snapshot.workspaceId,
+    "--pane", snapshot.paneId,
+  ], { encoding: "utf8" });
+  execFileSync("cmux", [
+    "focus-panel", "--window", snapshot.windowId, "--workspace", snapshot.workspaceId,
+    "--panel", snapshot.surfaceId,
+  ], { encoding: "utf8" });
+}
+
+function sameCmuxIdentity(left: string | undefined, right: string | undefined): boolean {
+  return !!left && !!right && left.toLowerCase() === right.toLowerCase();
+}
+
+function restoreCmuxFocusIfOperationMoved(
+  before: CmuxFocusSnapshot | null,
+  targetSurface: string,
+  targetBefore?: CmuxFocusSnapshot | null,
+): void {
+  if (!isStableCmuxFocusSnapshot(before)) return;
+  const target = targetBefore ?? captureCmuxSurfaceSnapshot(targetSurface);
+  const after = captureCmuxFocusSnapshot();
+  if (shouldRestoreCmuxFocus(before, after, target)) {
+    restoreCmuxFocusSnapshot(before);
   }
 }
 
-function parseCmuxCreatedSurface(output: string, command: string): CmuxCreatedSurface {
-  const surfaceMatch = output.match(/surface:\d+/);
-  if (!surfaceMatch) {
+export function parseCmuxCreatedSurface(output: string, command: string): CmuxCreatedSurface {
+  const surfaceMatch = output.match(/(surface:\d+)\s+\(([0-9a-f-]{36})\)/i);
+  if (!surfaceMatch || !isStableCmuxId(surfaceMatch[2])) {
     throw new Error(`Unexpected cmux ${command} output: ${output}`);
   }
 
   return {
-    surface: surfaceMatch[0],
+    surface: surfaceMatch[2],
+    surfaceRef: surfaceMatch[1],
+    paneId: output.match(/pane:\d+\s+\(([0-9a-f-]{36})\)/i)?.[1],
     paneRef: output.match(/pane:\d+/)?.[0],
   };
+}
+
+export function isStableCmuxId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function renameCmuxSurface(surface: string, name: string): void {
@@ -715,28 +830,24 @@ function createCmuxSplitSurface(
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): CmuxCreatedSurface {
-  const identifySnapshot = captureCmuxIdentifySnapshot();
-  const focusSnapshot = identifySnapshot.focused;
-  const callerSnapshot = identifySnapshot.caller;
+  const focusSnapshot = captureCmuxFocusSnapshot();
+  if (!isStableCmuxFocusSnapshot(focusSnapshot)) {
+    throw new Error("Cannot capture stable cmux focus before creating a split.");
+  }
   let child: CmuxCreatedSurface | null = null;
 
   try {
-    const args = ["new-split", direction];
+    const args = ["new-split", direction, "--focus", "false"];
     if (fromSurface) args.push("--surface", fromSurface);
 
-    const output = execFileSync("cmux", args, { encoding: "utf8" }).trim();
+    const output = execFileSync("cmux", ["--id-format", "both", ...args], { encoding: "utf8" }).trim();
     child = parseCmuxCreatedSurface(output, "new-split");
-    child.paneRef ??= readCmuxPaneRefForSurface(child.surface) ?? undefined;
+    child.paneId ??= readCmuxPaneRefForSurface(child.surface) ?? undefined;
     renameCmuxSurface(child.surface, name);
     return child;
   } finally {
     if (child) {
-      restoreCmuxFocusIfLaunchSurfaceFocused(focusSnapshot, child, {
-        sourceSurfaceRef: fromSurface,
-        callerSnapshot,
-      });
-    } else {
-      restoreCmuxFocusSnapshot(focusSnapshot);
+      restoreCmuxFocusIfOperationMoved(focusSnapshot, child.surface);
     }
   }
 }
@@ -749,7 +860,7 @@ function createCmuxSplitSurface(
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For tmux/wezterm: falls back to split behavior.
  *
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (stable surface UUID in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
@@ -757,7 +868,7 @@ export function createSurface(name: string): string {
   if (backend === "cmux" && cmuxSubagentPane) {
     // Verify the pane still exists before adding a tab to it
     try {
-      const tree = execSync(`cmux tree`, { encoding: "utf8" });
+      const tree = execSync(`cmux --id-format both tree`, { encoding: "utf8" });
       if (tree.includes(cmuxSubagentPane)) {
         return createSurfaceInPane(name, cmuxSubagentPane);
       }
@@ -768,7 +879,7 @@ export function createSurface(name: string): string {
 
   if (backend === "cmux") {
     const created = createCmuxSplitSurface(name, "right", process.env.CMUX_SURFACE_ID);
-    cmuxSubagentPane = created.paneRef ?? null;
+    cmuxSubagentPane = created.paneId ?? null;
     return created.surface;
   }
 
@@ -786,31 +897,32 @@ export function createSurface(name: string): string {
  * Create a new surface (tab) in an existing cmux pane.
  */
 function createSurfaceInPane(name: string, pane: string): string {
-  const identifySnapshot = captureCmuxIdentifySnapshot();
-  const focusSnapshot = identifySnapshot.focused;
-  const callerSnapshot = identifySnapshot.caller;
+  const focusSnapshot = captureCmuxFocusSnapshot();
+  if (!isStableCmuxFocusSnapshot(focusSnapshot)) {
+    throw new Error("Cannot capture stable cmux focus before creating a surface.");
+  }
   let child: CmuxCreatedSurface | null = null;
 
   try {
-    const output = execFileSync("cmux", ["new-surface", "--pane", pane], { encoding: "utf8" }).trim();
+    const output = execFileSync(
+      "cmux",
+      ["--id-format", "both", "new-surface", "--pane", pane, "--focus", "false"],
+      { encoding: "utf8" },
+    ).trim();
     child = parseCmuxCreatedSurface(output, "new-surface");
-    child.paneRef ??= pane;
+    child.paneId ??= pane;
     renameCmuxSurface(child.surface, name);
     return child.surface;
   } finally {
     if (child) {
-      restoreCmuxFocusIfLaunchSurfaceFocused(focusSnapshot, child, {
-        callerSnapshot,
-      });
-    } else {
-      restoreCmuxFocusSnapshot(focusSnapshot);
+      restoreCmuxFocusIfOperationMoved(focusSnapshot, child.surface);
     }
   }
 }
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
+ * Returns an identifier (stable surface UUID in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
 export function createSurfaceSplit(
   name: string,
@@ -1215,9 +1327,92 @@ export function closeSurface(surface: string): void {
   zellijActionSync(["close-pane"], surface);
 }
 
+/** Close only through the backend and instance recorded at surface creation. */
+export function closeOwnedMuxTarget(target: OwnedMuxTarget, runtimeInstanceId?: string): void {
+  if (!ownedMuxTargetIsTrusted(target, process.env, runtimeInstanceId)) {
+    throw new Error(`Cannot prove ownership of ${target.backend} instance for ${target.id}.`);
+  }
+  if (target.backend === "cmux") {
+    if (!isStableCmuxId(target.id)) throw new Error(`Unsafe cmux surface identity ${target.id}.`);
+    const before = captureCmuxFocusSnapshot();
+    const targetSnapshot = captureCmuxSurfaceSnapshot(target.id);
+    if (!isStableCmuxFocusSnapshot(before) || !targetSnapshot) {
+      throw new Error(`Cannot safely guard cmux focus while closing ${target.id}.`);
+    }
+    if (isExactCmuxSurfaceFocused(before, targetSnapshot)) {
+      throw new Error(`Refusing to close focused cmux surface ${target.id}.`);
+    }
+    const immediatelyBeforeClose = captureCmuxFocusSnapshot();
+    if (
+      !isStableCmuxFocusSnapshot(immediatelyBeforeClose) ||
+      !sameCmuxFocus(before, immediatelyBeforeClose)
+    ) {
+      throw new Error(`Cmux focus changed while preparing to close ${target.id}.`);
+    }
+    try {
+      execFileSync("cmux", [
+        "close-surface",
+        "--window", targetSnapshot.windowId,
+        "--workspace", targetSnapshot.workspaceId,
+        "--surface", target.id,
+      ], { encoding: "utf8" });
+    } finally {
+      restoreCmuxFocusIfOperationMoved(before, target.id, targetSnapshot);
+    }
+    return;
+  }
+  if (target.backend === "tmux") {
+    execFileSync("tmux", ["kill-pane", "-t", target.id], { encoding: "utf8" });
+    return;
+  }
+  if (target.backend === "wezterm") {
+    execFileSync("wezterm", ["cli", "kill-pane", "--pane-id", target.id], { encoding: "utf8" });
+    return;
+  }
+  zellijActionSync(["close-pane"], target.id);
+}
+
+function jsonContainsSurfaceId(value: unknown, surfaceId: string): boolean {
+  if (typeof value === "string") return value.toLowerCase() === surfaceId.toLowerCase();
+  if (Array.isArray(value)) return value.some((item) => jsonContainsSurfaceId(item, surfaceId));
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.surface_id === "string" &&
+    record.surface_id.toLowerCase() === surfaceId.toLowerCase()
+  ) return true;
+  return Object.values(record).some((item) => jsonContainsSurfaceId(item, surfaceId));
+}
+
+/**
+ * Check an exact stable cmux UUID against a successful authoritative tree snapshot.
+ * `null` means cmux itself could not be queried; callers must not infer absence.
+ */
+function exactCmuxSurfaceExists(surface: string): boolean | null {
+  if (!isStableCmuxId(surface)) return null;
+  const result = spawnSync(
+    "cmux",
+    ["--json", "--id-format", "both", "tree", "--all"],
+    { encoding: "utf8" },
+  );
+  if (result.error || result.status !== 0 || !result.stdout.trim()) return null;
+  const tree = parseCmuxJson(result.stdout);
+  return tree == null ? null : jsonContainsSurfaceId(tree, surface);
+}
+
+export function surfaceExists(surface: string): boolean | null {
+  if (getMuxBackend() !== "cmux") return null;
+  return exactCmuxSurfaceExists(surface);
+}
+
+export function ownedMuxTargetExists(target: OwnedMuxTarget, runtimeInstanceId?: string): boolean | null {
+  if (!ownedMuxTargetIsTrusted(target, process.env, runtimeInstanceId)) return null;
+  return target.backend === "cmux" ? exactCmuxSurfaceExists(target.id) : null;
+}
+
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "ping" | "sentinel" | "error";
+  reason: "done" | "ping" | "sentinel" | "error" | "disappeared";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Ping data if reason is "ping" */
@@ -1264,6 +1459,12 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    /** Test seam / exact backend existence check after a screen-read failure. */
+    surfaceExists?: (surface: string) => boolean | null;
+    /** Test seam for proving conservative reload paths issue no terminal command. */
+    readSurface?: (surface: string, lines: number) => Promise<string>;
+    /** Reconciliation mode for untrusted legacy/mismatched targets: sidecars only. */
+    completionFilesOnly?: boolean;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -1294,9 +1495,38 @@ export async function pollForExit(
       } catch {}
     }
 
+    if (options.completionFilesOnly) {
+      const elapsed = Math.floor((Date.now() - start) / 1000);
+      options.onTick?.(elapsed);
+      await new Promise<void>((resolve, reject) => {
+        if (signal.aborted) return reject(new Error("Aborted"));
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, options.interval);
+        function onAbort() {
+          clearTimeout(timer);
+          reject(new Error("Aborted"));
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      continue;
+    }
+
+    // Reload may already have an authoritative exact-UUID absence snapshot.
+    // Check it only after completion files so completion evidence always wins,
+    // and before screen access so a reused legacy short ref is never touched.
+    if (options.surfaceExists?.(surface) === false) {
+      return {
+        reason: "disappeared",
+        exitCode: 1,
+        errorMessage: "Subagent terminal surface disappeared before completion.",
+      };
+    }
+
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await (options.readSurface ?? readScreenAsync)(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
@@ -1312,6 +1542,17 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+
+      // Only an authoritative negative lookup for this exact stable identity is
+      // disappearance evidence. Short refs and query failures are never enough.
+      const exists = (options.surfaceExists ?? surfaceExists)(surface);
+      if (exists === false) {
+        return {
+          reason: "disappeared",
+          exitCode: 1,
+          errorMessage: "Subagent terminal surface disappeared before completion.",
+        };
       }
     }
 

@@ -21,13 +21,17 @@ import {
   createSurface,
   sendLongCommand,
   pollForExit,
-  closeSurface,
+  closeOwnedMuxTarget,
   getMuxBackend,
   sendEscape,
   shellEscape,
   renameCurrentTab,
   renameWorkspace,
   readScreen,
+  isStableCmuxId,
+  muxInstanceIdentity,
+  ownedMuxTargetExists,
+  ownedMuxTargetIsTrusted,
 } from "./cmux.ts";
 
 import {
@@ -58,14 +62,23 @@ import {
 } from "./activity.ts";
 import {
   abandonAgentReservation,
+  agentIncarnation,
+  agentIncarnationMatches,
+  activateAgentSurface,
+  activeOwnedSurface,
   initializeTeam,
   listTeamAgents,
+  markAgentSurface,
+  readAgent,
   releaseAgentSlot,
   reserveAgentSlot,
+  reserveAgentSlotForResume,
   restoreAgentAfterFailedResume,
   teamEnvironment,
   updateAgent,
   type LaunchPolicy,
+  type ExpectedAgentIncarnation,
+  type OwnedSurfaceRecord,
   type TeamAgentRecord,
   type TeamContext,
 } from "./team.ts";
@@ -688,6 +701,8 @@ interface SubagentResult {
   ping?: { name: string; message: string };
   /** Watcher detached on extension/session shutdown; the child remains team-owned. */
   detached?: boolean;
+  /** Another watcher already committed this run's durable terminal transition. */
+  duplicate?: boolean;
 }
 
 /**
@@ -696,12 +711,14 @@ interface SubagentResult {
 interface RunningSubagent {
   id: string;
   runId: string;
+  incarnation: ExpectedAgentIncarnation;
   agentPath: string;
   team: TeamContext;
   name: string;
   task: string;
   agent?: string;
   surface: string;
+  ownedSurface?: OwnedSurfaceRecord;
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
@@ -723,10 +740,72 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  watcherPromise?: Promise<SubagentResult>;
+  finalizationPromise?: Promise<SubagentResult>;
+  finalizedResult?: SubagentResult;
+  surfaceFinalizationState?: "closed" | "orphaned" | "close_failed";
+  surfaceExistsCheck?: (surface: string) => boolean | null;
+  completionFilesOnly?: boolean;
+}
+
+const MUX_RUNTIME_INSTANCE_ID = randomUUID();
+
+function ownedSurfaceIsTrusted(owned: OwnedSurfaceRecord): boolean {
+  return ownedMuxTargetIsTrusted(owned, process.env, MUX_RUNTIME_INSTANCE_ID);
+}
+
+function closeOwnedSurface(owned: OwnedSurfaceRecord): void {
+  closeOwnedMuxTarget(owned, MUX_RUNTIME_INSTANCE_ID);
+}
+
+function ownedSurfaceExists(owned: OwnedSurfaceRecord): boolean | null {
+  return ownedMuxTargetExists(owned, MUX_RUNTIME_INSTANCE_ID);
+}
+
+function ownedSurfaceForTarget(surface: string): OwnedSurfaceRecord | undefined {
+  const backend = getMuxBackend();
+  if (!backend) return undefined;
+  if (backend === "cmux" && !isStableCmuxId(surface)) return undefined;
+  const instanceId = muxInstanceIdentity(backend);
+  if (!instanceId) return undefined;
+  const now = new Date().toISOString();
+  return {
+    backend,
+    id: surface,
+    instanceId,
+    ...(backend === "cmux" ? {} : { runtimeInstanceId: MUX_RUNTIME_INSTANCE_ID }),
+    state: "active",
+    createdAt: now,
+    updatedAt: now,
+  };
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+const FINALIZATION_REGISTRY_KEY = Symbol.for("pi.subagents.finalization-registry");
+
+interface SharedFinalizationEntry {
+  promise: Promise<SubagentResult>;
+}
+
+function finalizationRegistry(): Map<string, SharedFinalizationEntry> {
+  const global = globalThis as any;
+  return global[FINALIZATION_REGISTRY_KEY] ??=
+    new Map<string, SharedFinalizationEntry>();
+}
+
+function finalizationKey(running: RunningSubagent): string {
+  return `${running.team.teamId}:${running.runId}:${running.incarnation ?? "legacy"}`;
+}
+
+function clearRunningIncarnation(running: RunningSubagent): void {
+  const current = runningSubagents.get(running.id);
+  if (current?.runId === running.runId && current.incarnation === running.incarnation) {
+    runningSubagents.delete(running.id);
+  }
+  updateWidget();
+}
 
 // ── Widget management ──
 
@@ -1047,7 +1126,7 @@ function handleSubagentInterrupt(
 
   running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   if (running.team && running.runId) {
-    updateAgent(running.team, running.runId, { status: "interrupted" });
+    updateAgent(running.team, running.runId, { status: "interrupted" }, running.incarnation);
   }
   updateWidget();
 
@@ -1085,7 +1164,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
         ? "waiting"
         : "running";
       try {
-        updateAgent(running.team, running.runId, { status: teamStatus });
+        updateAgent(running.team, running.runId, { status: teamStatus }, running.incarnation);
       } catch {
         // UI refresh must survive externally removed registry metadata.
       }
@@ -1116,6 +1195,40 @@ function startStatusRefresh(pi: ExtensionAPI) {
   }, 1000);
 
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
+}
+
+function cleanupOwnedSurfaces(
+  team: TeamContext,
+  record: TeamAgentRecord,
+  operations: {
+    close?: (owned: OwnedSurfaceRecord) => void;
+    exists?: (owned: OwnedSurfaceRecord) => boolean | null;
+    trusted?: (owned: OwnedSurfaceRecord) => boolean;
+  } = {},
+): TeamAgentRecord {
+  const expected = agentIncarnation(record);
+  for (const owned of record.surfaces ?? []) {
+    if (owned.state !== "active" && owned.state !== "close_failed") continue;
+    if (owned.backend === "cmux" && !isStableCmuxId(owned.id)) continue;
+    if (!(operations.trusted ?? ownedSurfaceIsTrusted)(owned)) {
+      markAgentSurface(team, record.runId, owned.id, "close_failed", expected);
+      throw new Error(`Cannot prove ownership of ${owned.backend} instance for ${owned.id}.`);
+    }
+    if ((operations.exists ?? ownedSurfaceExists)(owned) === false) {
+      markAgentSurface(team, record.runId, owned.id, "orphaned", expected);
+      continue;
+    }
+    try {
+      (operations.close ?? closeOwnedSurface)(owned);
+      markAgentSurface(team, record.runId, owned.id, "closed", expected);
+    } catch (error) {
+      markAgentSurface(team, record.runId, owned.id, "close_failed", expected);
+      throw new Error(
+        `Could not close previously owned surface ${owned.id}: ${(error as Error).message}`,
+      );
+    }
+  }
+  return readAgent(team, record.runId) ?? record;
 }
 
 interface ResumeOverrides {
@@ -1236,6 +1349,10 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   findResumeSource,
+  finalizeSubagent,
+  watchSubagent,
+  cleanupOwnedSurfaces,
+  resolveReconciledSurface,
   runningSubagents,
   formatElapsed,
 };
@@ -1340,12 +1457,20 @@ async function launchSubagent(
     },
   });
   let surface: string | undefined;
+  let launchedOwnership: OwnedSurfaceRecord | undefined;
 
   try {
   // Use pre-created surface (parallel mode) or create a new one. Capacity has
   // already been reserved atomically across the whole team.
   const surfacePreCreated = !!options?.surface;
+  const launchBackend = getMuxBackend();
+  if (!launchBackend || !muxInstanceIdentity(launchBackend)) {
+    throw new Error("Mux instance identity is unavailable; refusing an unowned launch");
+  }
   surface = options?.surface ?? createSurface(params.name);
+  launchedOwnership = ownedSurfaceForTarget(surface);
+  if (!launchedOwnership) throw new Error("Mux did not return a safely owned surface identity");
+  activateAgentSurface(team, runId, launchedOwnership, agentIncarnation(teamAgent));
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -1434,16 +1559,17 @@ async function launchSubagent(
       ].join("\n"),
     });
 
-    updateAgent(team, runId, { surface, status: "running" });
     const running: RunningSubagent = {
       id,
       runId,
+      incarnation: agentIncarnation(teamAgent),
       agentPath: teamAgent.path,
       team,
       name: params.name,
       task: params.task,
       agent: params.agent,
       surface,
+      ownedSurface: launchedOwnership,
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
@@ -1585,23 +1711,23 @@ async function launchSubagent(
   });
 
   updateAgent(team, runId, {
-    surface,
-    status: "running",
     launchPolicy: {
       ...teamAgent.launchPolicy,
       activityFile,
       launchScriptFile,
     },
-  });
+  }, agentIncarnation(teamAgent));
   const running: RunningSubagent = {
     id,
     runId,
+    incarnation: agentIncarnation(teamAgent),
     agentPath: teamAgent.path,
     team,
     name: params.name,
     task: params.task,
     agent: params.agent,
     surface,
+    ownedSurface: launchedOwnership,
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
@@ -1616,10 +1742,17 @@ async function launchSubagent(
   runningSubagents.set(id, running);
   return running;
   } catch (error) {
-    if (surface) {
-      try { closeSurface(surface); } catch {}
+    if (launchedOwnership) {
+      try {
+        closeOwnedSurface(launchedOwnership);
+        markAgentSurface(team, runId, launchedOwnership.id, "closed", agentIncarnation(teamAgent));
+      } catch {
+        markAgentSurface(team, runId, launchedOwnership.id, "close_failed", agentIncarnation(teamAgent));
+      }
+      await releaseAgentSlot(team, runId, "errored", { expectedIncarnation: agentIncarnation(teamAgent) });
+    } else {
+      await abandonAgentReservation(team, runId, agentIncarnation(teamAgent));
     }
-    await abandonAgentReservation(team, runId);
     throw error;
   }
 }
@@ -1650,7 +1783,99 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
-async function watchSubagent(
+async function finalizeSubagentOnce(
+  running: RunningSubagent,
+  result: SubagentResult,
+  surfaceState: "closed" | "orphaned",
+  operations: {
+    close?: (owned: OwnedSurfaceRecord) => void;
+    exists?: (owned: OwnedSurfaceRecord) => boolean | null;
+    trusted?: (owned: OwnedSurfaceRecord) => boolean;
+    release?: typeof releaseAgentSlot;
+  },
+): Promise<SubagentResult> {
+  if (!agentIncarnationMatches(readAgent(running.team, running.runId), running.incarnation)) {
+    clearRunningIncarnation(running);
+    return { ...result, duplicate: true };
+  }
+
+  const candidate = running.ownedSurface;
+  const owned = candidate?.backend === "cmux" && !isStableCmuxId(candidate.id)
+    ? undefined
+    : candidate;
+  let state = running.surfaceFinalizationState ?? surfaceState;
+
+  if (!running.surfaceFinalizationState && surfaceState === "closed" && owned) {
+    if (!(operations.trusted ?? ownedSurfaceIsTrusted)(owned)) {
+      state = "close_failed";
+    } else if ((operations.exists ?? ownedSurfaceExists)(owned) === false) {
+      state = "orphaned";
+    } else {
+      try {
+        (operations.close ?? closeOwnedSurface)(owned);
+      } catch {
+        state = "close_failed";
+      }
+    }
+    running.surfaceFinalizationState = state;
+  }
+
+  const transitioned = await (operations.release ?? releaseAgentSlot)(
+    running.team,
+    running.runId,
+    result.exitCode === 0 && !result.errorMessage && !result.error ? "completed" : "errored",
+    {
+      expectedIncarnation: running.incarnation,
+      ...(owned ? { surface: { id: owned.id, state } } : {}),
+    },
+  );
+  clearRunningIncarnation(running);
+  return transitioned ? result : { ...result, duplicate: true };
+}
+
+function finalizeSubagent(
+  running: RunningSubagent,
+  result: SubagentResult,
+  surfaceState: "closed" | "orphaned" = "closed",
+  operations: {
+    close?: (owned: OwnedSurfaceRecord) => void;
+    exists?: (owned: OwnedSurfaceRecord) => boolean | null;
+    trusted?: (owned: OwnedSurfaceRecord) => boolean;
+    release?: typeof releaseAgentSlot;
+  } = {},
+): Promise<SubagentResult> {
+  if (running.finalizedResult) return Promise.resolve(running.finalizedResult);
+  if (running.finalizationPromise) return running.finalizationPromise;
+
+  const registry = finalizationRegistry();
+  const key = finalizationKey(running);
+  const existing = registry.get(key);
+  const isOwner = !existing;
+  const pending = existing?.promise ?? finalizeSubagentOnce(running, result, surfaceState, operations);
+  const entry = existing ?? { promise: pending };
+  if (isOwner) registry.set(key, entry);
+
+  const tracked = pending.then(
+    (sharedResult) => {
+      const finalized = isOwner ? sharedResult : { ...sharedResult, duplicate: true };
+      if (!isOwner) clearRunningIncarnation(running);
+      running.finalizedResult = finalized;
+      return finalized;
+    },
+    (error) => {
+      running.finalizationPromise = undefined;
+      throw error;
+    },
+  );
+  running.finalizationPromise = tracked;
+  tracked.then(
+    () => { if (registry.get(key) === entry) registry.delete(key); },
+    () => { if (registry.get(key) === entry) registry.delete(key); },
+  );
+  return tracked;
+}
+
+async function watchSubagentOnce(
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
@@ -1658,116 +1883,100 @@ async function watchSubagent(
   const moduleSignal = getModuleAbortSignal();
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
+    const polled = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
-      onTick() {
-        observeRunningSubagent(running);
-      },
+      surfaceExists: running.surfaceExistsCheck,
+      completionFilesOnly: running.completionFilesOnly,
+      onTick() { observeRunningSubagent(running); },
     });
-
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
     if (running.cli === "claude") {
-      // Claude Code result extraction
       let summary = "";
-
       if (running.sentinelFile) {
+        try { summary = readFileSync(running.sentinelFile, "utf-8").trim(); } catch {}
+      }
+      if (!summary && polled.reason !== "disappeared") {
         try {
-          summary = readFileSync(running.sentinelFile, "utf-8").trim();
+          summary = readScreen(surface, 200).replace(/__SUBAGENT_DONE_\d+__/, "").trimEnd();
         } catch {}
       }
-
-      if (!summary) {
-        summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
-      }
-
-      if (!summary) {
-        summary = result.exitCode !== 0
-          ? `Claude Code exited with code ${result.exitCode}`
-          : "Claude Code exited without output";
-      }
-
-      // Copy Claude session transcript
+      if (!summary) summary = polled.errorMessage ??
+        (polled.exitCode !== 0 ? `Claude Code exited with code ${polled.exitCode}` : "Claude Code exited without output");
       let sessionId: string | null = null;
       if (running.sentinelFile) {
         sessionId = copyClaudeSession(running.sentinelFile);
         try { unlinkSync(running.sentinelFile); } catch {}
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
-
-      closeSurface(surface);
-      await releaseAgentSlot(running.team, running.runId, result.exitCode === 0 ? "completed" : "errored");
-      runningSubagents.delete(running.id);
-
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return finalizeSubagent(running, {
+        name, task, summary, exitCode: polled.exitCode, elapsed,
+        ...(polled.errorMessage ? { errorMessage: polled.errorMessage } : {}),
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      }, polled.reason === "disappeared" ? "orphaned" : "closed");
     }
 
-    // Pi subagent result extraction
-    let summary: string;
+    const fallback = polled.errorMessage
+      ? `Subagent error: ${polled.errorMessage}`
+      : polled.exitCode !== 0
+        ? `Sub-agent exited with code ${polled.exitCode}`
+        : "Sub-agent exited without output";
+    let summary = fallback;
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
-      summary =
-        findLastAssistantMessage(allEntries) ??
-        (result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
-    } else {
-      summary = result.errorMessage
-        ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+      try { summary = findLastAssistantMessage(getNewEntries(sessionFile, 0)) ?? fallback; } catch {}
     }
-
-    closeSurface(surface);
-    await releaseAgentSlot(running.team, running.runId, result.exitCode === 0 && !result.errorMessage ? "completed" : "errored");
-    runningSubagents.delete(running.id);
-
-    return {
-      name,
-      task,
-      summary,
-      sessionFile,
-      exitCode: result.exitCode,
-      elapsed,
-      ping: result.ping,
-      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-    };
+    return finalizeSubagent(running, {
+      name, task, summary, sessionFile, exitCode: polled.exitCode, elapsed,
+      ping: polled.ping,
+      ...(polled.errorMessage ? { errorMessage: polled.errorMessage } : {}),
+    }, polled.reason === "disappeared" ? "orphaned" : "closed");
   } catch (err: any) {
-    // Module reload and parent shutdown detach the local watcher only. They do
-    // not prove that the independently hosted child pane has terminated.
+    // Reload/shutdown only detaches this watcher. Durable ownership and the
+    // lease stay active for the next extension instance to reconcile.
     if (signal.aborted || moduleSignal.aborted) {
-      runningSubagents.delete(running.id);
+      if (runningSubagents.get(running.id) === running) runningSubagents.delete(running.id);
       return {
-        name,
-        task,
-        summary: "Subagent watcher detached; child remains active.",
-        exitCode: 0,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
-        detached: true,
-        sessionFile,
+        name, task, summary: "Subagent watcher detached; child remains active.",
+        exitCode: 0, elapsed: Math.floor((Date.now() - startTime) / 1000),
+        detached: true, sessionFile,
       };
     }
-    try {
-      closeSurface(surface);
-    } catch {}
-    await releaseAgentSlot(running.team, running.runId, "errored");
-    runningSubagents.delete(running.id);
-    return {
-      name,
-      task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
-      exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: err?.message ?? String(err),
-    };
+    const message = err?.message ?? String(err);
+    return finalizeSubagent(running, {
+      name, task, summary: `Subagent error: ${message}`, exitCode: 1,
+      elapsed: Math.floor((Date.now() - startTime) / 1000), error: message,
+    });
   }
+}
+
+function watchSubagent(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult> {
+  if (!running.watcherPromise) {
+    running.watcherPromise = watchSubagentOnce(running, signal);
+  }
+  return running.watcherPromise;
+}
+
+
+function resolveReconciledSurface(record: TeamAgentRecord): {
+  ownedSurface?: OwnedSurfaceRecord;
+  completionFilesOnly: boolean;
+  knownMissing: boolean;
+} {
+  const candidate = activeOwnedSurface(record) ?? undefined;
+  const ownedSurface = candidate?.backend === "cmux" && !isStableCmuxId(candidate.id)
+    ? undefined
+    : candidate;
+  const targetIsAccessible = ownedSurface?.backend === "cmux" &&
+    ownedSurface.backend === getMuxBackend() &&
+    ownedSurfaceIsTrusted(ownedSurface);
+  return {
+    ownedSurface,
+    completionFilesOnly: !targetIsAccessible,
+    knownMissing: !!targetIsAccessible && ownedSurface?.backend === "cmux" &&
+      ownedSurfaceExists(ownedSurface) === false,
+  };
 }
 
 function reconcileTeamWatchers(pi: ExtensionAPI, ctx: ExtensionContext): void {
@@ -1783,16 +1992,20 @@ function reconcileTeamWatchers(pi: ExtensionAPI, ctx: ExtensionContext): void {
     const id = record.runId.slice(0, 8);
     if (runningSubagents.has(id)) continue;
     const policy = record.launchPolicy;
+    const reconciliation = resolveReconciledSurface(record);
+    const { ownedSurface } = reconciliation;
     const startTime = Date.parse(record.createdAt) || Date.now();
     const running: RunningSubagent = {
       id,
       runId: record.runId,
+      incarnation: agentIncarnation(record),
       agentPath: record.path,
       team,
       name: record.displayName,
       task: typeof policy.task === "string" ? policy.task : "reconciled subagent",
       agent: record.role,
       surface: record.surface,
+      ownedSurface,
       startTime,
       sessionFile: record.sessionPath,
       launchScriptFile: typeof policy.launchScriptFile === "string" ? policy.launchScriptFile : undefined,
@@ -1804,9 +2017,12 @@ function reconcileTeamWatchers(pi: ExtensionAPI, ctx: ExtensionContext): void {
     runningSubagents.set(id, running);
     const watcherAbort = new AbortController();
     running.abortController = watcherAbort;
-    watchSubagent(running, watcherAbort.signal).then((result) => {
+    if (reconciliation.knownMissing) running.surfaceExistsCheck = () => false;
+    if (reconciliation.completionFilesOnly) running.completionFilesOnly = true;
+    const completion = watchSubagent(running, watcherAbort.signal);
+    completion.then((result) => {
       updateWidget();
-      if (result.detached) return;
+      if (result.detached || result.duplicate) return;
       pi.sendMessage(
         {
           customType: "subagent_result",
@@ -2058,7 +2274,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
-            if (result.detached) return;
+            if (result.detached || result.duplicate) return;
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -2429,12 +2645,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Record entry count before resuming so we can extract new messages.
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
         const team = getTeamContext(ctx);
-        const source = findResumeSource(team, params.sessionPath);
+        let source = findResumeSource(team, params.sessionPath);
         if (source && source.status !== "completed" && source.status !== "errored") {
           return {
             content: [{ type: "text" as const, text: `Subagent resume failed: ${source.path} is still ${source.status}.` }],
             details: { error: "session is still active", runId: source.runId, path: source.path },
           };
+        }
+        if (source) {
+          try {
+            source = cleanupOwnedSurfaces(team, source);
+          } catch (error) {
+            const message = (error as Error).message;
+            return {
+              content: [{ type: "text" as const, text: `Subagent resume failed: ${message}` }],
+              details: { error: message },
+            };
+          }
         }
         let restored: ReturnType<typeof resolveResumeLaunchBehavior>;
         try {
@@ -2451,7 +2678,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const id = runId.slice(0, 8);
         let teamAgent: TeamAgentRecord;
         try {
-          teamAgent = reserveAgentSlot(team, {
+          const reservation = {
             runId,
             displayName: name,
             ...(source ? { path: source.path, parentPath: source.parentPath ?? team.agentPath } : {}),
@@ -2462,7 +2689,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               task: params.message ?? "resumed session",
               resumedAt: new Date().toISOString(),
             },
-          });
+          };
+          teamAgent = source
+            ? await reserveAgentSlotForResume(team, {
+              ...reservation,
+              expectedPriorIncarnation: agentIncarnation(source),
+            })
+            : reserveAgentSlot(team, reservation);
         } catch (error) {
           const message = (error as Error).message;
           return {
@@ -2471,8 +2704,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
         let surface: string | undefined;
+        let launchedOwnership: OwnedSurfaceRecord | undefined;
         try {
+        const resumeBackend = getMuxBackend();
+        if (!resumeBackend || !muxInstanceIdentity(resumeBackend)) {
+          throw new Error("Mux instance identity is unavailable; refusing an unowned resume");
+        }
         surface = createSurface(name);
+        launchedOwnership = ownedSurfaceForTarget(surface);
+        if (!launchedOwnership) throw new Error("Mux did not return a safely owned surface identity");
+        activateAgentSurface(team, runId, launchedOwnership, agentIncarnation(teamAgent));
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
@@ -2583,24 +2824,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
 
         updateAgent(team, runId, {
-          surface,
-          status: "running",
           launchPolicy: {
             ...teamAgent.launchPolicy,
             activityFile,
             launchScriptFile,
           },
-        });
+        }, agentIncarnation(teamAgent));
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
           runId,
+          incarnation: agentIncarnation(teamAgent),
           agentPath: teamAgent.path,
           team,
           name,
           task: params.message ?? "resumed session",
           agent: role,
           surface,
+          ownedSurface: launchedOwnership,
           startTime,
           sessionFile: params.sessionPath,
           launchScriptFile,
@@ -2622,7 +2863,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
-            if (result.detached) return;
+            if (result.detached || result.duplicate) return;
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
@@ -2697,13 +2938,29 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           },
         };
         } catch (error) {
-          if (surface) {
-            try { closeSurface(surface); } catch {}
+          if (launchedOwnership) {
+            let failedSurfaceState: "closed" | "close_failed" = "closed";
+            try {
+              closeOwnedSurface(launchedOwnership);
+            } catch {
+              failedSurfaceState = "close_failed";
+            }
+            try {
+              markAgentSurface(
+                team,
+                runId,
+                launchedOwnership.id,
+                failedSurfaceState,
+                agentIncarnation(teamAgent),
+              );
+            } catch {
+              // A newer incarnation owns metadata; rollback below still removes only our lease.
+            }
           }
           if (source) {
-            await restoreAgentAfterFailedResume(team, source);
+            await restoreAgentAfterFailedResume(team, source, agentIncarnation(teamAgent));
           } else {
-            await abandonAgentReservation(team, runId);
+            await abandonAgentReservation(team, runId, agentIncarnation(teamAgent));
           }
           const message = (error as any)?.message ?? String(error);
           return {
