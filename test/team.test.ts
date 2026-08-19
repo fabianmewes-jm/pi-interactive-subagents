@@ -1,20 +1,27 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
   abandonAgentReservation,
+  acquireTeamMailboxCommitLock,
+  activateAgentSurface,
+  agentIncarnation,
+  activeOwnedSurface,
   initializeTeam,
   listTeamAgents,
+  markAgentSurface,
   readAgent,
   releaseAgentSlot,
   reserveAgentSlot,
+  reserveAgentSlotForResume,
   resolveTeamTarget,
   teamEnvironment,
   updateAgent,
+  restoreAgentAfterFailedResume,
 } from "../pi-extension/subagents/team.ts";
 import { parseTeamConfig } from "../pi-extension/subagents/config.ts";
 
@@ -137,6 +144,229 @@ describe("team registry and capacity", () => {
   }));
 });
 
+describe("durable surface ownership", () => {
+  it("admits only one simultaneous reservation for an exact terminal incarnation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-resume-race-"));
+    try {
+      const { context } = makeTeam(root);
+      const terminal = reserve(context, "worker");
+      await releaseAgentSlot(context, terminal.runId, "completed", {
+        expectedIncarnation: agentIncarnation(terminal),
+      });
+      const input = {
+        runId: terminal.runId,
+        expectedPriorIncarnation: agentIncarnation(terminal),
+        path: terminal.path,
+        parentPath: terminal.parentPath ?? context.agentPath,
+        displayName: terminal.displayName,
+        sessionPath: terminal.sessionPath,
+      };
+      const unlock = await acquireTeamMailboxCommitLock(context.teamDir);
+      let surfacesCreated = 0;
+      const contend = () => reserveAgentSlotForResume(context, input).then((record) => {
+        surfacesCreated += 1;
+        activateAgentSurface(context, record.runId, {
+          backend: "cmux",
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        }, agentIncarnation(record));
+        return record;
+      });
+      const left = contend();
+      const right = contend();
+      unlock();
+      const outcomes = await Promise.allSettled([left, right]);
+      const successes = outcomes.filter((outcome) => outcome.status === "fulfilled");
+      const failures = outcomes.filter((outcome) => outcome.status === "rejected");
+      assert.equal(successes.length, 1);
+      assert.equal(failures.length, 1);
+      assert.match(String((failures[0] as PromiseRejectedResult).reason), /resume conflict.*(?:starting|running) incarnation/i);
+      assert.equal(surfacesCreated, 1);
+      const winner = (successes[0] as PromiseFulfilledResult<ReturnType<typeof reserve>>).value;
+      assert.equal(readAgent(context, terminal.runId)?.incarnation, winner.incarnation);
+      assert.equal(
+        listTeamAgents(context).filter((agent) => agent.runId === terminal.runId).length,
+        1,
+      );
+      const matchingLeases = Array.from({ length: context.threadCap - 1 }, (_, index) => index + 1)
+        .map((slot) => {
+          try {
+            return JSON.parse(readFileSync(join(context.teamDir, "leases", String(slot), "owner.json"), "utf8"));
+          } catch {
+            return null;
+          }
+        })
+        .filter((lease) => lease?.runId === terminal.runId);
+      assert.deepEqual(matchingLeases.map((lease) => lease.incarnation), [winner.incarnation]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a failed post-surface resume lease and restores only its prior terminal record", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-resume-rollback-"));
+    try {
+      const { context } = makeTeam(root, 2);
+      const terminal = reserve(context, "worker");
+      await releaseAgentSlot(context, terminal.runId, "completed", {
+        expectedIncarnation: agentIncarnation(terminal),
+      });
+      const source = readAgent(context, terminal.runId)!;
+      const resumed = await reserveAgentSlotForResume(context, {
+        runId: terminal.runId,
+        expectedPriorIncarnation: agentIncarnation(source),
+        path: terminal.path,
+        parentPath: terminal.parentPath ?? context.agentPath,
+        displayName: terminal.displayName,
+        sessionPath: terminal.sessionPath,
+      });
+      const surfaceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      activateAgentSurface(context, resumed.runId, { backend: "cmux", id: surfaceId }, agentIncarnation(resumed));
+      assert.equal(
+        await restoreAgentAfterFailedResume(context, source, agentIncarnation(resumed)),
+        true,
+      );
+      const restored = readAgent(context, terminal.runId)!;
+      assert.equal(restored.incarnation, terminal.incarnation);
+      assert.equal(restored.status, "completed");
+      assert.equal(restored.surfaces?.some((surface) => surface.id === surfaceId), true);
+      assert.doesNotThrow(() => reserve(context, "replacement"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an old incarnation terminalize resumed metadata or delete its new lease", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-incarnation-race-"));
+    try {
+      const { context } = makeTeam(root);
+      const first = reserve(context, "worker");
+      const oldIncarnation = agentIncarnation(first);
+      await releaseAgentSlot(context, first.runId, "completed", { expectedIncarnation: oldIncarnation });
+      let delayedRelease: Promise<boolean> | undefined;
+      const resumed = await reserveAgentSlotForResume(context, {
+        runId: first.runId,
+        expectedPriorIncarnation: oldIncarnation,
+        path: first.path,
+        parentPath: first.parentPath ?? context.agentPath,
+        displayName: "worker",
+        sessionPath: first.sessionPath,
+        afterLeaseAcquired(reservation) {
+          const lease = JSON.parse(readFileSync(
+            join(context.teamDir, "leases", String(reservation.slot), "owner.json"),
+            "utf8",
+          ));
+          assert.equal(lease.incarnation, reservation.incarnation);
+          assert.equal(readAgent(context, first.runId)?.incarnation, first.incarnation);
+          delayedRelease = releaseAgentSlot(context, first.runId, "errored", {
+            expectedIncarnation: oldIncarnation,
+          });
+        },
+      });
+      assert.equal(await delayedRelease, false);
+      assert.notEqual(resumed.incarnation, first.incarnation);
+      assert.equal(readAgent(context, first.runId)?.incarnation, resumed.incarnation);
+      assert.equal(readAgent(context, first.runId)?.status, "starting");
+      const lease = JSON.parse(readFileSync(
+        join(context.teamDir, "leases", String(resumed.slot), "owner.json"),
+        "utf8",
+      ));
+      assert.equal(lease.incarnation, resumed.incarnation);
+      assert.equal(
+        await releaseAgentSlot(context, first.runId, "errored", { expectedIncarnation: oldIncarnation }),
+        false,
+      );
+      assert.equal(readAgent(context, first.runId)?.status, "starting");
+      await releaseAgentSlot(context, resumed.runId, "completed", {
+        expectedIncarnation: agentIncarnation(resumed),
+      });
+      const newer = await reserveAgentSlotForResume(context, {
+        runId: first.runId,
+        expectedPriorIncarnation: agentIncarnation(resumed),
+        path: first.path,
+        parentPath: first.parentPath ?? context.agentPath,
+        displayName: "worker",
+        sessionPath: first.sessionPath,
+      });
+      const staleSlot = newer.slot === 2 ? 3 : 2;
+      const staleLeaseDir = join(context.teamDir, "leases", String(staleSlot));
+      mkdirSync(staleLeaseDir, { recursive: true });
+      writeFileSync(join(staleLeaseDir, "owner.json"), JSON.stringify({
+        runId: first.runId,
+        incarnation: resumed.incarnation,
+        ownerPid: process.pid,
+        phase: "active",
+        updatedAt: new Date().toISOString(),
+      }));
+      assert.equal(
+        await restoreAgentAfterFailedResume(context, first, agentIncarnation(resumed)),
+        false,
+      );
+      assert.equal(existsSync(staleLeaseDir), false);
+      assert.equal(readAgent(context, first.runId)?.incarnation, newer.incarnation);
+      const newerLease = JSON.parse(readFileSync(
+        join(context.teamDir, "leases", String(newer.slot), "owner.json"),
+        "utf8",
+      ));
+      assert.equal(newerLease.incarnation, newer.incarnation);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains exact ownership history across terminal resume cycles", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-surface-history-"));
+    try {
+      const { context } = makeTeam(root);
+      const first = reserve(context, "worker");
+      const uuidA = "11111111-1111-4111-8111-111111111111";
+      const uuidB = "22222222-2222-4222-8222-222222222222";
+      activateAgentSurface(context, first.runId, { backend: "cmux", id: uuidA, ref: "surface:7" });
+      assert.equal(activeOwnedSurface(readAgent(context, first.runId)!)?.id, uuidA);
+      markAgentSurface(context, first.runId, uuidA, "closed");
+      await releaseAgentSlot(context, first.runId, "completed");
+
+      const resumed = reserve(context, "worker", {
+        runId: first.runId,
+        path: first.path,
+        parentPath: first.parentPath ?? context.agentPath,
+      });
+      activateAgentSurface(context, resumed.runId, { backend: "cmux", id: uuidB, ref: "surface:7" });
+      const record = readAgent(context, first.runId)!;
+      assert.deepEqual(record.surfaces?.map((surface) => [surface.id, surface.state]), [
+        [uuidA, "closed"],
+        [uuidB, "active"],
+      ]);
+      assert.equal(record.surface, uuidB);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps failed-resume ownership while restoring terminal metadata", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-failed-resume-history-"));
+    try {
+      const { context } = makeTeam(root);
+      const first = reserve(context, "worker");
+      const uuidA = "33333333-3333-4333-8333-333333333333";
+      const uuidB = "44444444-4444-4444-8444-444444444444";
+      activateAgentSurface(context, first.runId, { backend: "cmux", id: uuidA });
+      markAgentSurface(context, first.runId, uuidA, "closed");
+      await releaseAgentSlot(context, first.runId, "completed");
+      const terminal = readAgent(context, first.runId)!;
+      reserve(context, "worker", { runId: first.runId, path: first.path });
+      activateAgentSurface(context, first.runId, { backend: "cmux", id: uuidB });
+      markAgentSurface(context, first.runId, uuidB, "close_failed");
+      await restoreAgentAfterFailedResume(context, terminal);
+      const restored = readAgent(context, first.runId)!;
+      assert.equal(restored.status, "completed");
+      assert.deepEqual(restored.surfaces?.map((surface) => surface.id), [uuidA, uuidB]);
+      assert.equal(restored.surfaces?.[1].state, "close_failed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("team paths, resolution, and listing", () => {
   it("creates hierarchical paths and propagates team environment", () => withTeam(({ context }) => {
     const parent = reserve(context, "Parent");
@@ -150,6 +380,7 @@ describe("team paths, resolution, and listing", () => {
       PI_SUBAGENT_PARENT_PATH: parent.path,
       PI_SUBAGENT_THREAD_CAP: "4",
       PI_SUBAGENT_RUN_ID: child.runId,
+      PI_SUBAGENT_INCARNATION: child.incarnation,
     });
   }));
 

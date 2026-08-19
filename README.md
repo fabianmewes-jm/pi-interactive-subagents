@@ -62,14 +62,19 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — orchestration tools plus 3 commands. Tool availability depends on whether the current session is the coordinator or a child and on its access policy:
 
-| Tool                 | Description                                                                                 |
-| -------------------- | ------------------------------------------------------------------------------------------- |
-| `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
-| `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
-| `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| Tool | Available to | Description |
+| ---- | ------------ | ----------- |
+| `subagent` | coordinator + permitted children | Spawn a child asynchronously |
+| `subagent_interrupt` | coordinator + permitted children | Interrupt a running Pi child's current turn without terminating it |
+| `subagents_list` | coordinator + permitted children | List discoverable agent definitions (not running agents) |
+| `subagents_team` | coordinator + children | Show this team's runtime hierarchy and lifecycle snapshot |
+| `subagent_resume` | coordinator + permitted children | Resume a terminal child session asynchronously |
+| `subagent_message` | coordinator + children | Queue durable mail; never wakes or starts the recipient |
+| `subagent_followup` | coordinator + children | Queue durable mail and safely trigger the recipient's next turn |
+| `subagent_done` | children | Return the final assistant message to the direct parent and exit |
+| `caller_ping` | children | Request direct-parent help, notify it, and exit for later resume |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -139,11 +144,14 @@ cp config.json.example config.json
 {
   "status": {
     "enabled": true
+  },
+  "team": {
+    "maxThreads": 4
   }
 }
 ```
 
-`config.json` is gitignored so local overrides don't get committed.
+`status.enabled` toggles status supervision/display. `team.maxThreads` is the positive-integer, tree-wide thread cap and includes the coordinator; it defaults to `4`. Configuration is strictly validated: malformed JSON, wrong value types, or unsupported keys under `status`/`team` fail with an error rather than being ignored. `config.json` is gitignored so local overrides don't get committed.
 
 ---
 
@@ -153,7 +161,17 @@ cp config.json.example config.json
 // Named agent with defaults from agent definition
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
-// Force a full-context fork for this spawn
+// Stable hierarchy path, explicit model/reasoning, and the latest 3 proven user turns
+subagent({
+  name: "Auth worker",
+  taskName: "auth-fix",
+  task: "Fix the bug where...",
+  model: "openai-codex/gpt-5.6-codex",
+  thinking: "high",
+  forkTurns: "3"
+});
+
+// Backwards-compatible alias for forkTurns: "all"
 subagent({ name: "Iterate", fork: true, task: "Fix the bug where..." });
 
 // Agent defaults can choose a different session-mode via frontmatter
@@ -175,22 +193,47 @@ Only attachments from the latest user message are handed off; older images are
 not implicitly included.
 
 ### Parameters
-### Parameters
 
-| Parameter              | Type    | Default        | Description                                                                                       |
-| ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
-| `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
-| `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
-| `agent`                | string  | —              | Load defaults from agent definition                                                               |
-| `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | —              | Override agent's default model                                                                    |
-| `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
-| `skills`               | string  | —              | Comma-separated skill names                                                                       |
-| `tools`                | string  | —              | Comma-separated tool names                                                                        |
-| `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+| Parameter | Type | Default | Description |
+| --------- | ---- | ------- | ----------- |
+| `name` | string | required | Display name shown in the widget and pane title |
+| `task` | string | required | Task prompt |
+| `taskName` | string | agent `task-name`, then display name | Non-empty stable segment for the hierarchical team path; does not change the display name |
+| `agent` | string | — | Load defaults from an agent definition |
+| `model` | string | agent, then current Pi environment | Non-empty model override |
+| `thinking` | `low` / `medium` / `high` | agent, then current Pi environment | Reasoning override; requires an effective model |
+| `forkTurns` | `"none"` / `"all"` / positive integer string | agent `session-mode` | `none` creates lineage without copied turns; `all` copies all context; `N` copies the latest N proven user turns |
+| `fork` | boolean | `false` | Legacy alias: `true` means `forkTurns: "all"` |
+| `interactive` | boolean | derived | Suppress parent stall/recovery wakes; agent value wins, otherwise inverse of `auto-exit` |
+| `systemPrompt` | string | — | Append to the system prompt |
+| `skills` | string | agent default | Comma-separated skill names |
+| `tools` | string | agent default | Comma-separated tool names |
+| `cwd` | string | agent/project | Child working directory (see [Role Folders](#role-folders)) |
+
+Tool-call values take precedence over agent frontmatter, which takes precedence over inherited Pi model/reasoning defaults. For context, explicit `forkTurns` wins, then `fork: true`, then agent `session-mode`, then `standalone`. `fork: true` combined with any explicit `forkTurns` other than `"all"` is rejected. Invalid/empty model, task name, thinking value, or fork count is rejected before launch.
 
 ---
+
+## Multi-Agent Teams
+
+Every coordinator owns one runtime tree. A child may spawn descendants when its policy permits; nesting depth is unlimited, but concurrency is not. `team.maxThreads` is a shared, tree-wide atomic cap (default `4`) that includes the coordinator, so the default permits three concurrent descendants regardless of depth. A slot is reserved before pane creation and released on completion, failure, or safe recovery of an abandoned reservation. `subagents_team` reports this runtime tree; `subagents_list` only reports definitions.
+
+There is intentionally no `wait_agent`/`wait` tool. Spawn and resume are fire-and-forget, and completion, failure, help requests, and terminal notifications automatically wake the direct parent. Do not poll `subagents_team`, repeatedly inspect JSONL/log files, or use sleep/tail/watch loops. End the turn or continue independent work. Nested results return to the direct parent, not to every ancestor.
+
+### Durable messaging
+
+- `subagent_message` is queue-only: it commits attributed mail in global FIFO sequence and delivers it at the recipient's next agent-turn boundary. It never starts or wakes an idle agent.
+- `subagent_followup` uses the same durable queue, but safely starts or queues the recipient's next turn. It never interrupts an active turn or tool call. The root coordinator cannot be a follow-up target.
+- Targets may be an exact run ID, canonical/relative team path, unique display name, or `root` where permitted. Empty, unknown, ambiguous-name, self, terminal, cross-team, and invalid root targets are rejected.
+- Queues survive extension reload and session resume. Delivery is attributed and audited, ordered, and bounded: 16 KiB per message, 256 queued messages per recipient, 60 sends per sender per 60 seconds, 8 hops, loop detection, and batches of at most 50.
+
+### Trust and lifecycle boundaries
+
+Team identity comes only from parent-provided `PI_SUBAGENT_*` metadata validated against the same-team registry. Agents must use the tools: do not write team/mailbox JSON directly and do not transport messages by injecting multiplexer keystrokes. Mailbox files are private, atomically committed, and audited. Messaging does not bypass Pi's approval boundary; the coordinator/user remains the approval authority, and direct parents receive child help and terminal-result notifications.
+
+Interruption cancels only the current Pi turn and leaves the run resumable. Completion/failure is terminal; `subagent_resume` creates a new pane for a terminal session and restores its launch policy unless explicit resume overrides are supplied. `/reload` detaches local watchers rather than declaring children dead, then reconciles durable team state and queued mail.
+
+For cmux, creation, resume, reconciliation, and cleanup use stable surface UUIDs plus mux-instance ownership and guard/restore focus, so these operations remain focus-neutral. An authoritative missing UUID is reconciled as external disappearance. Legacy short IDs or records without provable ownership are handled conservatively and are never blindly targeted or closed. Other supported mux backends retain their documented behavior; the cmux ownership guarantees are not implied for them.
 
 ## Interrupting a running subagent
 
@@ -290,7 +333,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
 name: my-agent
 description: Does something specific
 model: anthropic/claude-sonnet-4-6
-thinking: minimal
+thinking: low
 tools: read, bash, edit, write
 session-mode: lineage-only
 spawning: false
@@ -308,11 +351,12 @@ You are a specialized agent that does X...
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
-| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
+| `thinking`    | string  | Thinking level: `low`, `medium`, or `high`                                                                                                                                                                                                                                  |
+| `task-name`   | string  | Default stable team-path segment; overridden by spawn `taskName`                                                                                                                                                                                                            |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
+| `spawning`    | boolean | Set `false` to deny spawn/lifecycle delegation while retaining safe team/mailbox and child-completion tools unless separately denied                                                                                                                                        |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
@@ -398,7 +442,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Creates a delegation leaf by denying spawn/lifecycle delegation tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`). It does **not** deny `subagents_team`, `subagent_message`, `subagent_followup`, `subagent_done`, or `caller_ping`: a leaf may inspect its team and communicate safely while remaining unable to delegate. Use `deny-tools` as well if a leaf must not have a specific mailbox tool.
 
 ```yaml
 ---
@@ -420,13 +464,15 @@ deny-tools: subagent
 
 ### Recommended Configuration
 
-| Agent      | `spawning`  | Rationale                                    |
-| ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
-| worker     | `false`     | Should implement tasks, not delegate         |
-| researcher | `false`     | Should research, not spawn                   |
-| reviewer   | `false`     | Should review, not spawn                     |
-| scout      | `false`     | Should gather context, not spawn             |
+For same-model Sol teams, vary reasoning by role rather than model: use `scout` at `low`, routine `worker` at `medium`, and a smart worker/reviewer at `high`.
+
+| Agent | `thinking` | `spawning` | Rationale |
+| ----- | ---------- | ---------- | --------- |
+| planner | `medium` | _(default)_ | May spawn scouts for investigation |
+| scout | `low` | `false` | Fast reconnaissance leaf |
+| worker | `medium` | `false` | Routine implementation leaf |
+| smart-worker / reviewer | `high` | `false` | Hard implementation or review leaf |
+| researcher | role-dependent | `false` | Research leaf |
 
 ---
 

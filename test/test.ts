@@ -24,10 +24,17 @@ import {
   isCmuxAvailable,
   isWezTermAvailable,
   parseCmuxFocusedSnapshot,
+  parseCmuxCallerSnapshot,
+  parseCmuxCreatedSurface,
+  isStableCmuxId,
+  isExactCmuxSurfaceFocused,
+  pollForExit,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxJson,
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
+  shouldRestoreCmuxFocus,
+  ownedMuxTargetIsTrusted,
   canSplitZellijPane,
   predictZellijSplitDirection,
   selectZellijPlacement,
@@ -56,6 +63,17 @@ import subagentDoneExtension, {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
 } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  activateAgentSurface,
+  agentIncarnation,
+  initializeTeam,
+  markAgentSurface,
+  readAgent,
+  releaseAgentSlot,
+  reserveAgentSlot,
+  updateAgent,
+} from "../pi-extension/subagents/team.ts";
+
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
@@ -1739,6 +1757,422 @@ describe("subagent activity snapshots", () => {
   });
 });
 
+describe("subagent surface finalization", () => {
+  it("clears runtime/team/capacity once and closes only the exact owned UUID", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const uuid = "55555555-5555-4555-8555-555555555555";
+      const owned = activateAgentSurface(team, agent.runId, { backend: "cmux", id: uuid, ref: "surface:9" }).surfaces![0];
+      const testApi = (subagentsModule as any).__test__;
+      const running = {
+        id: agent.runId.slice(0, 8), runId: agent.runId, agentPath: agent.path, team,
+        incarnation: agentIncarnation(agent),
+        name: "worker", task: "task", surface: uuid, ownedSurface: owned,
+        startTime: Date.now(), sessionFile: agent.sessionPath, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      testApi.runningSubagents.set(running.id, running);
+      const closed: string[] = [];
+      const result = { name: "worker", task: "task", summary: "done", exitCode: 0, elapsed: 1 };
+      await testApi.finalizeSubagent(running, result, "closed", {
+        close: (target: { id: string }) => closed.push(target.id), trusted: () => true,
+      });
+      await testApi.finalizeSubagent(running, result, "closed", {
+        close: (target: { id: string }) => closed.push(target.id), trusted: () => true,
+      });
+      assert.deepEqual(closed, [uuid]);
+      assert.equal(testApi.runningSubagents.has(running.id), false);
+      assert.equal(readAgent(team, agent.runId)?.status, "completed");
+      assert.equal(readAgent(team, agent.runId)?.surfaces?.[0].state, "closed");
+      assert.doesNotThrow(() => reserveAgentSlot(team, { displayName: "replacement", sessionPath: join(dir, "next.jsonl") }));
+    } finally {
+      (subagentsModule as any).__test__.runningSubagents.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets only one competing completion/disappearance watcher commit and close", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const uuid = "99999999-9999-4999-8999-999999999999";
+      const owned = activateAgentSurface(team, agent.runId, { backend: "cmux", id: uuid }).surfaces![0];
+      const base = {
+        id: agent.runId.slice(0, 8), runId: agent.runId, agentPath: agent.path, team,
+        incarnation: agentIncarnation(agent),
+        name: "worker", task: "task", surface: uuid, ownedSurface: owned,
+        startTime: Date.now(), sessionFile: agent.sessionPath, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      const closed: string[] = [];
+      const testApi = (subagentsModule as any).__test__;
+      const [completion, disappearance] = await Promise.all([
+        testApi.finalizeSubagent(
+          { ...base },
+          { name: "worker", task: "task", summary: "done", exitCode: 0, elapsed: 1 },
+          "closed",
+          { close: (target: { id: string }) => closed.push(target.id), trusted: () => true },
+        ),
+        testApi.finalizeSubagent(
+          { ...base },
+          { name: "worker", task: "task", summary: "gone", exitCode: 1, elapsed: 1, error: "gone" },
+          "orphaned",
+          { close: (target: { id: string }) => closed.push(target.id), trusted: () => true },
+        ),
+      ]);
+      assert.equal([completion, disappearance].filter((item) => !item.duplicate).length, 1);
+      assert.equal([completion, disappearance].filter((item) => item.duplicate).length, 1);
+      assert.deepEqual(closed, [uuid]);
+      assert.match(readAgent(team, agent.runId)?.status ?? "", /completed|errored/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks cross-reload finalization followers duplicate and clears both module-local maps", async () => {
+    const dir = createTestDir();
+    try {
+      const suffix = `${Date.now()}-${Math.random()}`;
+      const ownerModule = await import(`../pi-extension/subagents/index.ts?owner=${suffix}`);
+      const followerModule = await import(`../pi-extension/subagents/index.ts?follower=${suffix}`);
+      const ownerApi = (ownerModule as any).__test__;
+      const followerApi = (followerModule as any).__test__;
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const uuid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+      const owned = activateAgentSurface(team, agent.runId, { backend: "cmux", id: uuid }).surfaces![0];
+      const makeRunning = () => ({
+        id: agent.runId.slice(0, 8), runId: agent.runId, incarnation: agentIncarnation(agent),
+        agentPath: agent.path, team, name: "worker", task: "task", surface: uuid,
+        ownedSurface: owned, startTime: Date.now(), sessionFile: agent.sessionPath,
+        interactive: false, statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      });
+      const ownerRunning = makeRunning();
+      const followerRunning = makeRunning();
+      ownerApi.runningSubagents.set(ownerRunning.id, ownerRunning);
+      followerApi.runningSubagents.set(followerRunning.id, followerRunning);
+
+      let releaseOwner!: () => void;
+      const lifecycleLock = new Promise<void>((resolve) => { releaseOwner = resolve; });
+      let ownerEntered!: () => void;
+      const ownerStarted = new Promise<void>((resolve) => { ownerEntered = resolve; });
+      const closed: string[] = [];
+      const result = { name: "worker", task: "task", summary: "done", exitCode: 0, elapsed: 1 };
+      const owner = ownerApi.finalizeSubagent(ownerRunning, result, "closed", {
+        trusted: () => true,
+        close: (target: { id: string }) => closed.push(target.id),
+        release: async (...args: Parameters<typeof releaseAgentSlot>) => {
+          ownerEntered();
+          await lifecycleLock;
+          return releaseAgentSlot(...args);
+        },
+      });
+      await ownerStarted;
+      const follower = followerApi.finalizeSubagent(followerRunning, result, "closed", {
+        trusted: () => true,
+        close: () => { throw new Error("follower must not close"); },
+      });
+      assert.equal(ownerApi.runningSubagents.has(ownerRunning.id), true);
+      assert.equal(followerApi.runningSubagents.has(followerRunning.id), true);
+
+      releaseOwner();
+      const [ownerResult, followerResult] = await Promise.all([owner, follower]);
+      assert.equal(ownerResult.duplicate, undefined);
+      assert.equal(followerResult.duplicate, true);
+      let parentNotifications = 0;
+      for (const completed of [ownerResult, followerResult]) {
+        if (!completed.duplicate) parentNotifications += 1;
+      }
+      assert.equal(parentNotifications, 1);
+      assert.deepEqual(closed, [uuid]);
+      assert.equal(ownerApi.runningSubagents.has(ownerRunning.id), false);
+      assert.equal(followerApi.runningSubagents.has(followerRunning.id), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps failed finalization retryable and does not publish success early", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const uuid = "77777777-7777-4777-8777-777777777777";
+      const owned = activateAgentSurface(team, agent.runId, { backend: "cmux", id: uuid }).surfaces![0];
+      const running = {
+        id: agent.runId.slice(0, 8), runId: agent.runId, incarnation: agentIncarnation(agent),
+        agentPath: agent.path, team, name: "worker", task: "task", surface: uuid,
+        ownedSurface: owned, startTime: Date.now(), sessionFile: agent.sessionPath,
+        interactive: false, statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      const testApi = (subagentsModule as any).__test__;
+      testApi.runningSubagents.set(running.id, running);
+      let closes = 0;
+      await assert.rejects(
+        testApi.finalizeSubagent(
+          running,
+          { name: "worker", task: "task", summary: "done", exitCode: 0, elapsed: 1 },
+          "closed",
+          {
+            trusted: () => true,
+            close: () => { closes += 1; },
+            release: async () => { throw new Error("injected release failure"); },
+          },
+        ),
+        /injected release failure/,
+      );
+      assert.equal(running.finalizedResult, undefined);
+      assert.equal(readAgent(team, agent.runId)?.status, "running");
+      assert.equal(testApi.runningSubagents.get(running.id), running);
+
+      const retried = await testApi.finalizeSubagent(
+        running,
+        { name: "worker", task: "task", summary: "done", exitCode: 0, elapsed: 1 },
+        "closed",
+        { trusted: () => true, close: () => { closes += 1; } },
+      );
+      assert.equal(retried.exitCode, 0);
+      assert.equal(closes, 1);
+      assert.equal(readAgent(team, agent.runId)?.status, "completed");
+      assert.equal(readAgent(team, agent.runId)?.surfaces?.[0].state, "closed");
+      assert.equal(testApi.runningSubagents.has(running.id), false);
+    } finally {
+      (subagentsModule as any).__test__.runningSubagents.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("makes a delayed old finalizer harmless after the run id is resumed", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const old = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const oldUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const oldOwned = activateAgentSurface(team, old.runId, { backend: "cmux", id: oldUuid }).surfaces![0];
+      await releaseAgentSlot(team, old.runId, "completed", { expectedIncarnation: agentIncarnation(old) });
+      const resumed = reserveAgentSlot(team, {
+        runId: old.runId, path: old.path, displayName: "worker", sessionPath: old.sessionPath,
+      });
+      const newUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      activateAgentSurface(team, resumed.runId, { backend: "cmux", id: newUuid }, agentIncarnation(resumed));
+      let touched = false;
+      const result = await (subagentsModule as any).__test__.finalizeSubagent(
+        {
+          id: old.runId.slice(0, 8), runId: old.runId, incarnation: agentIncarnation(old),
+          agentPath: old.path, team, name: "worker", task: "old", surface: oldUuid,
+          ownedSurface: oldOwned, startTime: Date.now(), sessionFile: old.sessionPath,
+          interactive: false, statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        },
+        { name: "worker", task: "old", summary: "late", exitCode: 0, elapsed: 1 },
+        "closed",
+        { trusted: () => true, close: () => { touched = true; } },
+      );
+      assert.equal(result.duplicate, true);
+      assert.equal(touched, false);
+      assert.equal(readAgent(team, resumed.runId)?.incarnation, resumed.incarnation);
+      assert.equal(readAgent(team, resumed.runId)?.status, "running");
+      assert.equal(readAgent(team, resumed.runId)?.surface, newUuid);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("detaches on shutdown abort without terminalizing or releasing", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const uuid = "88888888-8888-4888-8888-888888888888";
+      const owned = activateAgentSurface(team, agent.runId, { backend: "cmux", id: uuid }).surfaces![0];
+      const running = {
+        id: agent.runId.slice(0, 8), runId: agent.runId, agentPath: agent.path, team,
+        incarnation: agentIncarnation(agent),
+        name: "worker", task: "task", surface: uuid, ownedSurface: owned,
+        startTime: Date.now(), sessionFile: agent.sessionPath, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      const abort = new AbortController();
+      abort.abort();
+      const result = await (subagentsModule as any).__test__.watchSubagent(running, abort.signal);
+      assert.equal(result.detached, true);
+      assert.equal(readAgent(team, agent.runId)?.status, "running");
+      assert.equal(readAgent(team, agent.runId)?.surfaces?.[0].state, "active");
+      assert.throws(
+        () => reserveAgentSlot(team, { displayName: "one", sessionPath: join(dir, "one.jsonl") }) &&
+          reserveAgentSlot(team, { displayName: "two", sessionPath: join(dir, "two.jsonl") }) &&
+          reserveAgentSlot(team, { displayName: "three", sessionPath: join(dir, "three.jsonl") }),
+        /capacity reached/i,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("finalizes despite close failure and never closes a missing/legacy surface", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const uuid = "66666666-6666-4666-8666-666666666666";
+      const owned = activateAgentSurface(team, agent.runId, { backend: "cmux", id: uuid }).surfaces![0];
+      const running = {
+        id: agent.runId.slice(0, 8), runId: agent.runId, agentPath: agent.path, team,
+        incarnation: agentIncarnation(agent),
+        name: "worker", task: "task", surface: uuid, ownedSurface: owned,
+        startTime: Date.now(), sessionFile: agent.sessionPath, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      const testApi = (subagentsModule as any).__test__;
+      testApi.runningSubagents.set(running.id, running);
+      await testApi.finalizeSubagent(
+        running,
+        { name: "worker", task: "task", summary: "failed", exitCode: 1, elapsed: 1, error: "gone" },
+        "closed",
+        { close: () => { throw new Error("injected close failure"); }, trusted: () => true },
+      );
+      assert.equal(readAgent(team, agent.runId)?.status, "errored");
+      assert.equal(readAgent(team, agent.runId)?.surfaces?.[0].state, "close_failed");
+
+      let touched = false;
+      const legacyAgent = reserveAgentSlot(team, { displayName: "legacy", sessionPath: join(dir, "legacy.jsonl") });
+      const legacy = {
+        ...running,
+        id: legacyAgent.runId.slice(0, 8),
+        runId: legacyAgent.runId,
+        incarnation: agentIncarnation(legacyAgent),
+        surface: "surface:9",
+        ownedSurface: undefined,
+        finalizationPromise: undefined,
+        finalizedResult: undefined,
+      };
+      testApi.runningSubagents.set(legacy.id, legacy);
+      await testApi.finalizeSubagent(
+        legacy,
+        { name: "legacy", task: "task", summary: "missing", exitCode: 1, elapsed: 1, error: "missing" },
+        "orphaned",
+        { close: () => { touched = true; } },
+      );
+      assert.equal(touched, false);
+      assert.equal(readAgent(team, legacyAgent.runId)?.status, "errored");
+    } finally {
+      (subagentsModule as any).__test__.runningSubagents.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it("treats a live legacy reload surface as unknown and retains its lease", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const legacy = reserveAgentSlot(team, { displayName: "legacy", sessionPath: join(dir, "legacy.jsonl") });
+      updateAgent(team, legacy.runId, { status: "running", surface: "surface:7" }, agentIncarnation(legacy));
+      const reconciliation = (subagentsModule as any).__test__.resolveReconciledSurface(
+        readAgent(team, legacy.runId),
+      );
+      assert.equal(reconciliation.ownedSurface, undefined);
+      assert.equal(reconciliation.completionFilesOnly, true);
+      assert.equal(reconciliation.knownMissing, false);
+      let reads = 0;
+      let existenceChecks = 0;
+      const abort = new AbortController();
+      setTimeout(() => abort.abort(), 5);
+      await assert.rejects(
+        pollForExit("surface:7", abort.signal, {
+          interval: 50,
+          sessionFile: legacy.sessionPath,
+          completionFilesOnly: true,
+          readSurface: async () => { reads += 1; return ""; },
+          surfaceExists: () => { existenceChecks += 1; return false; },
+        }),
+        /aborted/i,
+      );
+      assert.equal(reads, 0);
+      assert.equal(existenceChecks, 0);
+      assert.equal(readAgent(team, legacy.runId)?.status, "running");
+      assert.throws(
+        () => reserveAgentSlot(team, { displayName: "one", sessionPath: join(dir, "one.jsonl") }) &&
+          reserveAgentSlot(team, { displayName: "two", sessionPath: join(dir, "two.jsonl") }) &&
+          reserveAgentSlot(team, { displayName: "three", sessionPath: join(dir, "three.jsonl") }),
+        /capacity reached/i,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans a same-runtime non-cmux close failure during immediate resume", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const runtimeInstanceId = "current-extension-runtime";
+      const owned = activateAgentSurface(team, agent.runId, {
+        backend: "zellij",
+        id: "pane:41",
+        instanceId: "same-zellij-session",
+        runtimeInstanceId,
+      }).surfaces![0];
+      markAgentSurface(team, agent.runId, owned.id, "close_failed");
+      await releaseAgentSlot(team, agent.runId, "completed", { expectedIncarnation: agentIncarnation(agent) });
+      const closed: string[] = [];
+      const cleaned = (subagentsModule as any).__test__.cleanupOwnedSurfaces(
+        team,
+        readAgent(team, agent.runId),
+        {
+          trusted: (target: typeof owned) => ownedMuxTargetIsTrusted(
+            target,
+            { ZELLIJ_SESSION_NAME: "same-zellij-session" },
+            runtimeInstanceId,
+          ),
+          close: (target: typeof owned) => closed.push(target.id),
+        },
+      );
+      assert.deepEqual(closed, [owned.id]);
+      assert.equal(cleaned.surfaces?.find((item) => item.id === owned.id)?.state, "closed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never sends a recorded backend identity to another current backend", async () => {
+    const dir = createTestDir();
+    try {
+      const team = initializeTeam({ artifactDir: join(dir, "artifacts"), sessionPath: join(dir, "root.jsonl"), env: {} });
+      const agent = reserveAgentSlot(team, { displayName: "worker", sessionPath: join(dir, "worker.jsonl") });
+      const owned = activateAgentSurface(team, agent.runId, {
+        backend: "zellij",
+        id: "pane:42",
+        instanceId: "same-zellij-session",
+        runtimeInstanceId: "old-extension-runtime",
+      }).surfaces![0];
+      await releaseAgentSlot(team, agent.runId, "completed", { expectedIncarnation: agentIncarnation(agent) });
+      let touched = false;
+      assert.throws(
+        () => (subagentsModule as any).__test__.cleanupOwnedSurfaces(
+          team,
+          readAgent(team, agent.runId),
+          {
+            trusted: (target: typeof owned) => ownedMuxTargetIsTrusted(
+              target,
+              { ZELLIJ_SESSION_NAME: "same-zellij-session" },
+              "new-extension-runtime",
+            ),
+            close: () => { touched = true; },
+          },
+        ),
+        /cannot prove ownership/i,
+      );
+      assert.equal(touched, false);
+      assert.equal(readAgent(team, agent.runId)?.surfaces?.find((item) => item.id === owned.id)?.state, "close_failed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+});
+
 describe("subagent interruption", () => {
   function makeRunning(overrides: Record<string, unknown> = {}) {
     return {
@@ -2238,6 +2672,57 @@ describe("subagents widget rendering", () => {
 
 describe("cmux.ts", () => {
   describe("shellEscape", () => {
+  describe("stable cmux ownership", () => {
+    it("parses the stable UUID from id-format both creation output", () => {
+      const surfaceId = "12345678-1234-4234-8234-123456789abc";
+      const paneId = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+      assert.deepEqual(
+        parseCmuxCreatedSurface(
+          `OK surface:913 (${surfaceId}) pane:28 (${paneId}) workspace:2 (aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa)`,
+          "new-split",
+        ),
+        { surface: surfaceId, surfaceRef: "surface:913", paneId, paneRef: "pane:28" },
+      );
+      assert.equal(isStableCmuxId(surfaceId), true);
+      assert.equal(isStableCmuxId("surface:913"), false);
+      assert.throws(
+        () => parseCmuxCreatedSurface("OK surface:913", "new-split"),
+        /Unexpected cmux new-split output/,
+      );
+    });
+
+    it("terminalizes an exact disappearance after a read failure", async () => {
+      const result = await pollForExit(
+        "12345678-1234-4234-8234-123456789abc",
+        new AbortController().signal,
+        { interval: 1, surfaceExists: () => false },
+      );
+      assert.equal(result.reason, "disappeared");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage ?? "", /surface disappeared/i);
+    });
+    it("prefers an existing completion sidecar over disappearance", async () => {
+      const dir = createTestDir();
+      try {
+        const sessionFile = join(dir, "child.jsonl");
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
+        const result = await pollForExit(
+          "77777777-7777-4777-8777-777777777777",
+          new AbortController().signal,
+          { interval: 1, sessionFile, surfaceExists: () => false },
+        );
+        assert.equal(result.reason, "done");
+        assert.equal(result.exitCode, 0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("never treats a legacy short ref as a stable owned cmux identity", () => {
+      assert.equal(isStableCmuxId("surface:913"), false);
+    });
+  });
+
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
     });
@@ -2278,6 +2763,123 @@ describe("cmux.ts", () => {
     it("returns null for malformed values", () => {
       assert.equal(parseCmuxFocusedSnapshot(null), null);
       assert.equal(parseCmuxFocusedSnapshot({ focused: {} }), null);
+    });
+  });
+
+  describe("cmux stable focus snapshots", () => {
+    const before = {
+      windowId: "11111111-1111-4111-8111-111111111111",
+      workspaceId: "22222222-2222-4222-8222-222222222222",
+      paneId: "33333333-3333-4333-8333-333333333333",
+      surfaceId: "44444444-4444-4444-8444-444444444444",
+    };
+    const target = {
+      windowId: "55555555-5555-4555-8555-555555555555",
+      workspaceId: "66666666-6666-4666-8666-666666666666",
+      paneId: "77777777-7777-4777-8777-777777777777",
+      surfaceId: "88888888-8888-4888-8888-888888888888",
+    };
+
+    it("parses stable window/workspace/pane/surface UUIDs for focused and caller contexts", () => {
+      const raw = {
+        focused: {
+          window_id: before.windowId, workspace_id: before.workspaceId,
+          pane_id: before.paneId, surface_id: before.surfaceId,
+        },
+        caller: {
+          window_id: target.windowId, workspace_id: target.workspaceId,
+          pane_id: target.paneId, surface_id: target.surfaceId,
+        },
+      };
+      assert.deepEqual(parseCmuxFocusedSnapshot(raw), before);
+      assert.deepEqual(parseCmuxCallerSnapshot(raw), target);
+    });
+
+    it("restores only when the operation moved focus to the exact target surface", () => {
+      assert.equal(isExactCmuxSurfaceFocused(before, before), true);
+      assert.equal(isExactCmuxSurfaceFocused(before, target), false);
+      assert.equal(shouldRestoreCmuxFocus(before, before, target), false);
+      assert.equal(shouldRestoreCmuxFocus(before, target, target), true);
+      assert.equal(shouldRestoreCmuxFocus(before, { ...target, surfaceId: before.surfaceId }, target), false);
+      assert.equal(shouldRestoreCmuxFocus(before, {
+        ...before,
+        windowId: target.windowId,
+        workspaceId: target.workspaceId,
+      }, target), false);
+    });
+
+    it("never restores over unrelated or ambiguous concurrent focus changes", () => {
+      const unrelated = {
+        windowId: "99999999-9999-4999-8999-999999999999",
+        workspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        paneId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        surfaceId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      };
+      assert.equal(shouldRestoreCmuxFocus(before, unrelated, target), false);
+      // Other tab in the target pane is ambiguous and belongs to the user.
+      assert.equal(shouldRestoreCmuxFocus(before, {
+        ...target,
+        surfaceId: unrelated.surfaceId,
+      }, target), false);
+      // Other pane in the target workspace is ambiguous.
+      assert.equal(shouldRestoreCmuxFocus(before, {
+        ...target,
+        paneId: unrelated.paneId,
+        surfaceId: unrelated.surfaceId,
+      }, target), false);
+      // Other workspace in the target window is ambiguous.
+      assert.equal(shouldRestoreCmuxFocus(before, {
+        ...target,
+        workspaceId: unrelated.workspaceId,
+        paneId: unrelated.paneId,
+        surfaceId: unrelated.surfaceId,
+      }, target), false);
+      assert.equal(shouldRestoreCmuxFocus(before, {
+        ...before,
+        paneId: unrelated.paneId,
+        surfaceId: unrelated.surfaceId,
+      }, { ...target, windowId: before.windowId, workspaceId: before.workspaceId }), false);
+      assert.equal(shouldRestoreCmuxFocus(
+        { surfaceRef: "surface:1" },
+        { surfaceRef: "surface:2" },
+        { surfaceRef: "surface:2" },
+      ), false);
+    });
+  });
+
+  describe("mux instance reuse safety", () => {
+    it("rejects same-name or reused non-cmux targets from another extension instance", () => {
+      const cases = [
+        {
+          target: { backend: "zellij" as const, id: "pane:7", instanceId: "same-session", runtimeInstanceId: "old" },
+          env: { ZELLIJ_SESSION_NAME: "same-session" },
+        },
+        {
+          target: { backend: "tmux" as const, id: "%7", instanceId: "/tmp/tmux,42,0", runtimeInstanceId: "old" },
+          env: { TMUX: "/tmp/tmux,42,0" },
+        },
+        {
+          target: { backend: "wezterm" as const, id: "7", instanceId: "/tmp/gui.sock", runtimeInstanceId: "old" },
+          env: { WEZTERM_UNIX_SOCKET: "/tmp/gui.sock" },
+        },
+      ];
+      for (const { target, env } of cases) {
+        assert.equal(ownedMuxTargetIsTrusted(target, env, "old"), true);
+        assert.equal(ownedMuxTargetIsTrusted(target, env, "new"), false);
+        assert.equal(ownedMuxTargetIsTrusted({ ...target, runtimeInstanceId: undefined }, env, "old"), false);
+      }
+    });
+
+    it("keeps cmux trust durable because both target and operations use stable UUIDs", () => {
+      const target = {
+        backend: "cmux" as const,
+        id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        instanceId: "/tmp/cmux.sock",
+      };
+      assert.equal(
+        ownedMuxTargetIsTrusted(target, { CMUX_SOCKET_PATH: "/tmp/cmux.sock" }, "different-runtime"),
+        true,
+      );
     });
   });
 

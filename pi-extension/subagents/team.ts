@@ -37,16 +37,38 @@ export interface LaunchPolicy {
   [key: string]: unknown;
 }
 
+export type OwnedSurfaceState = "active" | "closed" | "orphaned" | "close_failed";
+
+export interface OwnedSurfaceRecord {
+  backend: "cmux" | "tmux" | "zellij" | "wezterm";
+  /** Authoritative operation target. For cmux this is always a stable UUID. */
+  id: string;
+  /** Backend instance identity captured at creation; absent legacy records are untrusted. */
+  instanceId?: string;
+  /** Volatile extension-instance proof required for muxes with reusable target IDs. */
+  runtimeInstanceId?: string;
+  ref?: string;
+  paneId?: string;
+  state: OwnedSurfaceState;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TeamAgentRecord {
   version: 1;
   teamId: string;
   runId: string;
+  /** Collision-resistant reservation generation. Absent only on legacy records. */
+  incarnation?: string;
   path: string;
   parentPath: string | null;
   displayName: string;
   role?: string;
   sessionPath: string;
+  /** Current backend target. Legacy records may contain an unsafe short cmux ref. */
   surface?: string;
+  /** Durable ownership history retained across resumes. */
+  surfaces?: OwnedSurfaceRecord[];
   status: TeamAgentStatus;
   slot: number;
   ownerPid: number;
@@ -77,6 +99,13 @@ export interface ReserveAgentInput {
   parentPath?: string;
   ownerPid?: number;
   now?: Date;
+  /** Deterministic lifecycle-race test seam; runs after lease creation, before metadata replacement. */
+  afterLeaseAcquired?: (reservation: { runId: string; incarnation: string; slot: number }) => void;
+}
+
+export interface ResumeAgentReservationInput extends ReserveAgentInput {
+  runId: string;
+  expectedPriorIncarnation: ExpectedAgentIncarnation;
 }
 
 const TERMINAL = new Set<TeamAgentStatus>(["completed", "errored"]);
@@ -203,10 +232,35 @@ function leaseRecordPath(teamDir: string, slot: number): string {
   return join(leaseDir(teamDir, slot), "owner.json");
 }
 
+interface LeaseOwner {
+  runId: string;
+  incarnation?: string;
+  ownerPid: number;
+  phase: "reserved" | "active";
+  updatedAt: string;
+}
+
+export type ExpectedAgentIncarnation = string | null;
+
+export function agentIncarnation(record: TeamAgentRecord): ExpectedAgentIncarnation {
+  return record.incarnation ?? null;
+}
+
+export function agentIncarnationMatches(
+  record: TeamAgentRecord | null,
+  expected: ExpectedAgentIncarnation,
+): boolean {
+  return !!record && agentIncarnation(record) === expected;
+}
+
+function leaseIncarnationMatches(lease: LeaseOwner | null, expected: ExpectedAgentIncarnation): boolean {
+  return !!lease && (lease.incarnation ?? null) === expected;
+}
+
 function acquireLease(
   teamDir: string,
   slot: number,
-  owner: { runId: string; ownerPid: number; phase: "reserved" | "active"; updatedAt: string },
+  owner: LeaseOwner,
 ): boolean {
   const leasesDir = join(teamDir, "leases");
   mkdirSync(leasesDir, { recursive: true });
@@ -307,10 +361,12 @@ function ensureRootAgent(context: TeamContext, sessionPath: string): void {
   if (existing) return;
   const now = new Date().toISOString();
   const runId = `root-${context.teamId}`;
+  const incarnation = randomUUID();
   const root: TeamAgentRecord = {
     version: 1,
     teamId: context.teamId,
     runId,
+    incarnation,
     path: ROOT_AGENT_PATH,
     parentPath: null,
     displayName: "root",
@@ -324,7 +380,7 @@ function ensureRootAgent(context: TeamContext, sessionPath: string): void {
     launchPolicy: {},
   };
   atomicWriteJson(metadataPath(context.teamDir, runId), root);
-  acquireLease(context.teamDir, 0, { runId, ownerPid: process.pid, phase: "active", updatedAt: now });
+  acquireLease(context.teamDir, 0, { runId, incarnation, ownerPid: process.pid, phase: "active", updatedAt: now });
 }
 
 function slug(value: string): string {
@@ -364,7 +420,7 @@ function assertReusablePath(
   return path;
 }
 
-function recoverLeaseIfSafe(context: TeamContext, slot: number): boolean {
+function recoverLeaseIfSafe(context: TeamContext, slot: number, commitLockHeld = false): boolean {
   const recoveryLock = join(context.teamDir, "leases", `${slot}.recovery`);
   try {
     mkdirSync(recoveryLock);
@@ -373,25 +429,29 @@ function recoverLeaseIfSafe(context: TeamContext, slot: number): boolean {
     throw error;
   }
   try {
-    const lease = readJson<{ runId?: string; ownerPid?: number; phase?: string }>(leaseRecordPath(context.teamDir, slot));
+    const lease = readJson<LeaseOwner>(leaseRecordPath(context.teamDir, slot));
     if (!lease?.runId) {
       rmSync(leaseDir(context.teamDir, slot), { recursive: true, force: true });
       return true;
     }
     const agent = readAgent(context, lease.runId);
-    if (agent && TERMINAL.has(agent.status)) {
+    if (agent && TERMINAL.has(agent.status) && leaseIncarnationMatches(lease, agentIncarnation(agent))) {
       rmSync(leaseDir(context.teamDir, slot), { recursive: true, force: true });
       return true;
     }
     // Only an unfinished reservation can be reclaimed from a dead reserving process.
     // Once marked active, pane/process liveness must be reconciled by the surface owner.
-    if ((!agent || agent.status === "starting") && lease.phase !== "active" && !processAlive(lease.ownerPid ?? -1)) {
-      const commit = tryAcquireMailboxCommitLock(context.teamDir);
+    const reservationMetadataPending = !agent || agent.status === "starting" ||
+      (TERMINAL.has(agent.status) && !leaseIncarnationMatches(lease, agentIncarnation(agent)));
+    if (reservationMetadataPending && lease.phase !== "active" && !processAlive(lease.ownerPid ?? -1)) {
+      const commit = commitLockHeld ? () => {} : tryAcquireMailboxCommitLock(context.teamDir);
       if (!commit) return false;
       try {
         const fresh = lease.runId ? readAgent(context, lease.runId) : null;
-        if (fresh && fresh.status !== "starting" && !TERMINAL.has(fresh.status)) return false;
-        if (fresh) {
+        const freshMatches = !!fresh && leaseIncarnationMatches(lease, agentIncarnation(fresh));
+        if (fresh && !freshMatches && !TERMINAL.has(fresh.status)) return false;
+        if (freshMatches && fresh!.status !== "starting" && !TERMINAL.has(fresh!.status)) return false;
+        if (fresh && freshMatches) {
           atomicWriteJson(metadataPath(context.teamDir, fresh.runId), {
             ...fresh,
             status: "errored",
@@ -411,29 +471,48 @@ function recoverLeaseIfSafe(context: TeamContext, slot: number): boolean {
   }
 }
 
-export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput): TeamAgentRecord {
+function reserveAgentSlotInternal(
+  context: TeamContext,
+  input: ReserveAgentInput,
+  expectedPriorIncarnation: ExpectedAgentIncarnation | undefined,
+  commitLockHeld: boolean,
+): TeamAgentRecord {
   mkdirSync(join(context.teamDir, "leases"), { recursive: true });
   mkdirSync(join(context.teamDir, "agents"), { recursive: true });
   const runId = input.runId ?? randomUUID();
+  const incarnation = randomUUID();
   const ownerPid = input.ownerPid ?? process.pid;
   const parentPath = input.parentPath ?? context.agentPath;
   const now = (input.now ?? new Date()).toISOString();
   const previousRecord = readAgent(context, runId);
+  if (expectedPriorIncarnation !== undefined && (
+    !previousRecord ||
+    !TERMINAL.has(previousRecord.status) ||
+    !agentIncarnationMatches(previousRecord, expectedPriorIncarnation)
+  )) {
+    const actual = previousRecord
+      ? `${previousRecord.status} incarnation ${previousRecord.incarnation ?? "legacy"}`
+      : "missing metadata";
+    throw new Error(
+      `Resume conflict for agent ${runId}: expected terminal incarnation ${expectedPriorIncarnation ?? "legacy"}, found ${actual}.`,
+    );
+  }
   if (previousRecord && !TERMINAL.has(previousRecord.status)) {
     throw new Error(`Cannot reuse active agent identity ${runId} (${previousRecord.status}).`);
   }
 
   for (let slot = 1; slot < context.threadCap; slot += 1) {
-    const leaseOwner = { runId, ownerPid, phase: "reserved" as const, updatedAt: now };
+    const leaseOwner = { runId, incarnation, ownerPid, phase: "reserved" as const, updatedAt: now };
     if (!acquireLease(context.teamDir, slot, leaseOwner)) {
-      if (!recoverLeaseIfSafe(context, slot) || !acquireLease(context.teamDir, slot, leaseOwner)) continue;
+      if (!recoverLeaseIfSafe(context, slot, commitLockHeld) || !acquireLease(context.teamDir, slot, leaseOwner)) continue;
     }
-
     try {
+      input.afterLeaseAcquired?.({ runId, incarnation, slot });
       const record: TeamAgentRecord = {
         version: 1,
         teamId: context.teamId,
         runId,
+        incarnation,
         path: input.path
           ? assertReusablePath(context, input.path, runId, parentPath)
           : canonicalChildPath(context, parentPath, input.taskName ?? input.displayName, runId),
@@ -447,6 +526,7 @@ export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput)
         createdAt: previousRecord?.createdAt ?? now,
         updatedAt: now,
         launchPolicy: input.launchPolicy ?? {},
+        ...(previousRecord?.surfaces ? { surfaces: previousRecord.surfaces } : {}),
       };
       atomicWriteJson(metadataPath(context.teamDir, runId), record);
       return record;
@@ -466,6 +546,37 @@ export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput)
   );
 }
 
+export function reserveAgentSlot(context: TeamContext, input: ReserveAgentInput): TeamAgentRecord {
+  return reserveAgentSlotInternal(context, input, undefined, false);
+}
+
+/** Atomically replaces one exact terminal incarnation with a single resumed reservation. */
+export async function reserveAgentSlotForResume(
+  context: TeamContext,
+  input: ResumeAgentReservationInput,
+): Promise<TeamAgentRecord> {
+  const reserve = () => reserveAgentSlotInternal(
+    context,
+    input,
+    input.expectedPriorIncarnation,
+    true,
+  );
+  const immediate = tryAcquireMailboxCommitLock(context.teamDir);
+  if (immediate) {
+    try {
+      return reserve();
+    } finally {
+      immediate();
+    }
+  }
+  const release = await acquireLifecycleMailboxCommitLock(context.teamDir);
+  try {
+    return reserve();
+  } finally {
+    release();
+  }
+}
+
 export function readAgent(context: TeamContext, runId: string): TeamAgentRecord | null {
   const record = readJson<TeamAgentRecord>(metadataPath(context.teamDir, basename(runId)));
   return record?.teamId === context.teamId ? record : null;
@@ -475,9 +586,13 @@ function updateAgentRecord(
   context: TeamContext,
   runId: string,
   patch: Partial<Omit<TeamAgentRecord, "teamId" | "runId" | "version" | "createdAt">>,
+  expectedIncarnation?: ExpectedAgentIncarnation,
 ): TeamAgentRecord {
   const current = readAgent(context, runId);
   if (!current) throw new Error(`Unknown team agent ${runId}.`);
+  if (expectedIncarnation !== undefined && !agentIncarnationMatches(current, expectedIncarnation)) {
+    throw new Error(`Stale agent incarnation for ${runId}.`);
+  }
   const updated: TeamAgentRecord = {
     ...current,
     ...patch,
@@ -487,10 +602,18 @@ function updateAgentRecord(
     createdAt: current.createdAt,
     updatedAt: new Date().toISOString(),
   };
+  const activatesLease = !!patch.surface || !!(patch.status && patch.status !== "starting");
+  if (activatesLease) {
+    const lease = readJson<LeaseOwner>(leaseRecordPath(context.teamDir, current.slot));
+    if (lease?.runId !== runId || !leaseIncarnationMatches(lease, agentIncarnation(current))) {
+      throw new Error(`Agent incarnation ${runId} no longer owns slot ${current.slot}.`);
+    }
+  }
   atomicWriteJson(metadataPath(context.teamDir, runId), updated);
-  if (patch.surface || (patch.status && patch.status !== "starting")) {
+  if (activatesLease) {
     atomicWriteJson(leaseRecordPath(context.teamDir, current.slot), {
       runId,
+      ...(current.incarnation ? { incarnation: current.incarnation } : {}),
       ownerPid: current.ownerPid,
       phase: "active",
       updatedAt: updated.updatedAt,
@@ -499,57 +622,159 @@ function updateAgentRecord(
   return updated;
 }
 
+export function activateAgentSurface(
+  context: TeamContext,
+  runId: string,
+  surface: Omit<OwnedSurfaceRecord, "state" | "createdAt" | "updatedAt">,
+  expectedIncarnation?: ExpectedAgentIncarnation,
+): TeamAgentRecord {
+  const current = readAgent(context, runId);
+  if (!current) throw new Error(`Unknown team agent ${runId}.`);
+  if (expectedIncarnation !== undefined && !agentIncarnationMatches(current, expectedIncarnation)) {
+    throw new Error(`Stale agent incarnation for ${runId}.`);
+  }
+  const now = new Date().toISOString();
+  const previous = current.surfaces ?? [];
+  const surfaces = previous
+    .filter((owned) => !(owned.backend === surface.backend && owned.id === surface.id))
+    .map((owned) => owned.state === "active" ? { ...owned, state: "orphaned" as const, updatedAt: now } : owned);
+  surfaces.push({ ...surface, state: "active", createdAt: now, updatedAt: now });
+  return updateAgentRecord(context, runId, { surface: surface.id, surfaces, status: "running" }, expectedIncarnation);
+}
+
+export function markAgentSurface(
+  context: TeamContext,
+  runId: string,
+  surfaceId: string,
+  state: Exclude<OwnedSurfaceState, "active">,
+  expectedIncarnation?: ExpectedAgentIncarnation,
+): TeamAgentRecord | null {
+  const current = readAgent(context, runId);
+  if (!current) return null;
+  if (expectedIncarnation !== undefined && !agentIncarnationMatches(current, expectedIncarnation)) return null;
+  const now = new Date().toISOString();
+  let matched = false;
+  const surfaces = (current.surfaces ?? []).map((owned) => {
+    if (owned.id !== surfaceId) return owned;
+    matched = true;
+    if (owned.state === state || owned.state === "closed") return owned;
+    return { ...owned, state, updatedAt: now };
+  });
+  if (!matched) return current;
+  return updateAgentRecord(context, runId, {
+    surfaces,
+    ...(current.surface === surfaceId ? { surface: undefined } : {}),
+  }, expectedIncarnation);
+}
+
+export function activeOwnedSurface(record: TeamAgentRecord): OwnedSurfaceRecord | null {
+  if (!record.surface) return null;
+  return record.surfaces?.find(
+    (owned) => owned.id === record.surface && owned.state === "active",
+  ) ?? null;
+}
+
 export function updateAgent(
   context: TeamContext,
   runId: string,
   patch: Partial<Omit<TeamAgentRecord, "teamId" | "runId" | "version" | "createdAt">>,
+  expectedIncarnation?: ExpectedAgentIncarnation,
 ): TeamAgentRecord {
   if (patch.status && TERMINAL.has(patch.status)) {
     throw new Error("Terminal agent transitions must use releaseAgentSlot().");
   }
-  return updateAgentRecord(context, runId, patch);
+  return updateAgentRecord(context, runId, patch, expectedIncarnation);
+}
+
+export interface ReleaseAgentSlotOptions {
+  expectedIncarnation?: ExpectedAgentIncarnation;
+  surface?: { id: string; state: Exclude<OwnedSurfaceState, "active"> };
+}
+
+function releasedSurfacePatch(
+  current: TeamAgentRecord,
+  surface: ReleaseAgentSlotOptions["surface"],
+): Partial<Pick<TeamAgentRecord, "surfaces" | "surface">> {
+  if (!surface) return {};
+  let matched = false;
+  const updatedAt = new Date().toISOString();
+  const surfaces = (current.surfaces ?? []).map((owned) => {
+    if (owned.id !== surface.id) return owned;
+    matched = true;
+    if (owned.state === "closed" || owned.state === surface.state) return owned;
+    return { ...owned, state: surface.state, updatedAt };
+  });
+  if (!matched) return {};
+  return {
+    surfaces,
+    ...(current.surface === surface.id ? { surface: undefined } : {}),
+  };
 }
 
 export function releaseAgentSlot(
   context: TeamContext,
   runId: string,
   status: "completed" | "errored" = "completed",
-): Promise<void> {
+  options: ReleaseAgentSlotOptions = {},
+): Promise<boolean> {
   const transition = () => {
     const current = readAgent(context, runId);
-    if (!current || current.path === ROOT_AGENT_PATH) return;
-    const updated = updateAgentRecord(context, runId, { status, terminalAt: new Date().toISOString() });
-    const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, updated.slot));
-    if (lease?.runId === runId) {
+    if (!current || current.path === ROOT_AGENT_PATH) return false;
+    if (
+      options.expectedIncarnation !== undefined &&
+      !agentIncarnationMatches(current, options.expectedIncarnation)
+    ) return false;
+    const expected = options.expectedIncarnation ?? agentIncarnation(current);
+    if (TERMINAL.has(current.status)) {
+      const lease = readJson<LeaseOwner>(leaseRecordPath(context.teamDir, current.slot));
+      if (lease?.runId === runId && leaseIncarnationMatches(lease, expected)) {
+        rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
+      }
+      return false;
+    }
+    const updated = updateAgentRecord(context, runId, {
+      status,
+      terminalAt: new Date().toISOString(),
+      ...releasedSurfacePatch(current, options.surface),
+    }, expected);
+    const lease = readJson<LeaseOwner>(leaseRecordPath(context.teamDir, updated.slot));
+    if (lease?.runId === runId && leaseIncarnationMatches(lease, expected)) {
       rmSync(leaseDir(context.teamDir, updated.slot), { recursive: true, force: true });
     }
+    return true;
   };
   const immediate = tryAcquireMailboxCommitLock(context.teamDir);
   if (immediate) {
+    let transitioned: boolean;
     try {
-      transition();
+      transitioned = transition();
     } finally {
       immediate();
     }
-    return Promise.resolve();
+    return Promise.resolve(transitioned);
   }
   return acquireLifecycleMailboxCommitLock(context.teamDir).then((release) => {
     try {
-      transition();
+      return transition();
     } finally {
       release();
     }
   });
 }
 
-export function abandonAgentReservation(context: TeamContext, runId: string): Promise<void> {
+export function abandonAgentReservation(
+  context: TeamContext,
+  runId: string,
+  expectedIncarnation?: ExpectedAgentIncarnation,
+): Promise<void> {
   const abandon = () => {
     const current = readAgent(context, runId);
     if (!current || current.path === ROOT_AGENT_PATH) return;
-    const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
-    if (lease?.runId === runId) {
-      rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
-    }
+    if (expectedIncarnation !== undefined && !agentIncarnationMatches(current, expectedIncarnation)) return;
+    const expected = expectedIncarnation ?? agentIncarnation(current);
+    const lease = readJson<LeaseOwner>(leaseRecordPath(context.teamDir, current.slot));
+    if (lease?.runId !== runId || !leaseIncarnationMatches(lease, expected)) return;
+    rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
     rmSync(metadataPath(context.teamDir, runId), { force: true });
   };
   const immediate = tryAcquireMailboxCommitLock(context.teamDir);
@@ -570,33 +795,68 @@ export function abandonAgentReservation(context: TeamContext, runId: string): Pr
   });
 }
 
+function removeIncarnationLeases(
+  context: TeamContext,
+  runId: string,
+  expected: ExpectedAgentIncarnation,
+): void {
+  for (let slot = 1; slot < context.threadCap; slot += 1) {
+    const lease = readJson<LeaseOwner>(leaseRecordPath(context.teamDir, slot));
+    if (lease?.runId === runId && leaseIncarnationMatches(lease, expected)) {
+      rmSync(leaseDir(context.teamDir, slot), { recursive: true, force: true });
+    }
+  }
+}
+
 /** Restore terminal metadata when a resume launch fails after reusing its run identity. */
 export function restoreAgentAfterFailedResume(
   context: TeamContext,
   previous: TeamAgentRecord,
-): Promise<void> {
+  expectedIncarnation?: ExpectedAgentIncarnation,
+): Promise<boolean> {
   const restore = () => {
     const current = readAgent(context, previous.runId);
-    if (current) {
-      const lease = readJson<{ runId?: string }>(leaseRecordPath(context.teamDir, current.slot));
-      if (lease?.runId === previous.runId) {
-        rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
+    if (
+      !current ||
+      (expectedIncarnation !== undefined && !agentIncarnationMatches(current, expectedIncarnation))
+    ) {
+      if (expectedIncarnation !== undefined) {
+        removeIncarnationLeases(context, previous.runId, expectedIncarnation);
       }
+      return false;
     }
-    atomicWriteJson(metadataPath(context.teamDir, previous.runId), previous);
+    const expected = expectedIncarnation ?? agentIncarnation(current);
+    const lease = readJson<LeaseOwner>(leaseRecordPath(context.teamDir, current.slot));
+    if (lease?.runId !== previous.runId || !leaseIncarnationMatches(lease, expected)) {
+      removeIncarnationLeases(context, previous.runId, expected);
+      return false;
+    }
+    rmSync(leaseDir(context.teamDir, current.slot), { recursive: true, force: true });
+    const currentSurfaces = current.surfaces ?? [];
+    const previousKeys = new Set((previous.surfaces ?? []).map((surface) => `${surface.backend}:${surface.id}`));
+    const mergedSurfaces = [
+      ...(previous.surfaces ?? []),
+      ...currentSurfaces.filter((surface) => !previousKeys.has(`${surface.backend}:${surface.id}`)),
+    ];
+    atomicWriteJson(metadataPath(context.teamDir, previous.runId), {
+      ...previous,
+      ...(mergedSurfaces.length > 0 ? { surfaces: mergedSurfaces } : {}),
+    });
+    return true;
   };
   const immediate = tryAcquireMailboxCommitLock(context.teamDir);
   if (immediate) {
+    let restored: boolean;
     try {
-      restore();
+      restored = restore();
     } finally {
       immediate();
     }
-    return Promise.resolve();
+    return Promise.resolve(restored);
   }
   return acquireLifecycleMailboxCommitLock(context.teamDir).then((release) => {
     try {
-      restore();
+      return restore();
     } finally {
       release();
     }
@@ -679,5 +939,6 @@ export function teamEnvironment(context: TeamContext, agent: TeamAgentRecord): R
     PI_SUBAGENT_PARENT_PATH: agent.parentPath ?? "",
     PI_SUBAGENT_THREAD_CAP: String(context.threadCap),
     PI_SUBAGENT_RUN_ID: agent.runId,
+    ...(agent.incarnation ? { PI_SUBAGENT_INCARNATION: agent.incarnation } : {}),
   };
 }
