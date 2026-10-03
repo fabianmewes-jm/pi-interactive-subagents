@@ -2,8 +2,8 @@
 name: worker
 description: Implements tasks from todos - writes code, runs tests, commits with polished messages
 tools: read, bash, write, edit
-model: anthropic/claude-sonnet-4-6
-thinking: minimal
+model: openai-codex/gpt-5.6-sol
+thinking: medium
 spawning: false
 auto-exit: true
 system-prompt: append

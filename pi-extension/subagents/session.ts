@@ -1,6 +1,14 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+
+const IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/bmp": "bmp",
+};
 
 export interface SessionEntry {
   type: string;
@@ -19,15 +27,128 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
-function getForkContentLines(parentSessionFile: string): string[] {
+interface ImageContent {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+function isImageContent(value: unknown): value is ImageContent {
+  if (!value || typeof value !== "object") return false;
+  const block = value as Partial<ImageContent>;
+  return (
+    block.type === "image" &&
+    typeof block.data === "string" &&
+    block.data.length > 0 &&
+    typeof block.mimeType === "string" &&
+    IMAGE_EXTENSIONS[block.mimeType.toLowerCase()] !== undefined
+  );
+}
+
+/**
+ * Save images from the latest user message on the active branch as files that
+ * a separately launched subagent can read. Older user-message images are not
+ * included: this handoff mirrors attachments on the turn that spawned it.
+ */
+export function materializeLatestUserImages(
+  branchEntries: Array<{ type?: string; message?: { role?: string; content?: unknown } }>,
+  outputDir: string,
+): string[] {
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i];
+    if (entry.type !== "message" || entry.message?.role !== "user") continue;
+
+    const content = entry.message.content;
+    if (!Array.isArray(content)) return [];
+    const images = content.filter(isImageContent);
+    if (images.length === 0) return [];
+
+    const absoluteOutputDir = resolve(outputDir);
+    mkdirSync(absoluteOutputDir, { recursive: true, mode: 0o700 });
+    return images.map((image, index) => {
+      const extension = IMAGE_EXTENSIONS[image.mimeType.toLowerCase()];
+      const imagePath = join(absoluteOutputDir, `image-${index + 1}.${extension}`);
+      writeFileSync(imagePath, Buffer.from(image.data, "base64"), { mode: 0o600 });
+      return imagePath;
+    });
+  }
+  return [];
+}
+
+export function appendImagePathInstructions(task: string, imagePaths: string[]): string {
+  if (imagePaths.length === 0) return task;
+  const paths = imagePaths.map((imagePath) => `- ${imagePath}`).join("\n");
+  return `${task}\n\nImages attached to the current main-session user message are available at these absolute paths:\n${paths}\nRead the relevant image files with the read tool before completing the task.`;
+}
+
+function parseLine(line: string): SessionEntry | null {
+  try {
+    return JSON.parse(line) as SessionEntry;
+  } catch {
+    return null;
+  }
+}
+
+function isUserMessage(entry: SessionEntry | null): boolean {
+  return entry?.type === "message" &&
+    (entry as Partial<MessageEntry>).message?.role === "user";
+}
+
+/**
+ * Copy the triggering turn's proven parent-id ancestry, optionally bounded
+ * to its latest N user turns.
+ * Entries on abandoned branches, or entries whose ancestry is missing, are
+ * deliberately not guessed into a bounded fork.
+ */
+function getAncestryForkContentLines(
+  lines: string[],
+  trigger: SessionEntry,
+  forkTurns: "all" | number,
+): string[] {
+  if (typeof trigger.parentId !== "string") return [];
+  const byId = new Map<string, { line: string; entry: SessionEntry }>();
+  for (const line of lines) {
+    const entry = parseLine(line);
+    if (entry?.type !== "session" && typeof entry?.id === "string") {
+      byId.set(entry.id, { line, entry });
+    }
+  }
+
+  const reverseChain: Array<{ line: string; entry: SessionEntry }> = [];
+  const visited = new Set<string>();
+  let parentId: string | undefined = trigger.parentId;
+  while (parentId && !visited.has(parentId)) {
+    visited.add(parentId);
+    const found = byId.get(parentId);
+    if (!found) break;
+    reverseChain.push(found);
+    parentId = typeof found.entry.parentId === "string" ? found.entry.parentId : undefined;
+  }
+
+  const chain = reverseChain.reverse();
+  if (forkTurns === "all") return chain.map((item) => item.line);
+
+  const userIndexes = chain
+    .map((item, index) => isUserMessage(item.entry) ? index : -1)
+    .filter((index) => index >= 0);
+  if (userIndexes.length === 0) return [];
+  const start = userIndexes[Math.max(0, userIndexes.length - forkTurns)];
+  return chain.slice(start).map((item, index) => {
+    if (index !== 0 || item.entry.parentId == null) return item.line;
+    const rebased = { ...item.entry, parentId: null };
+    return JSON.stringify(rebased);
+  });
+}
+
+function getForkContentLines(parentSessionFile: string, forkTurns: "all" | number): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
 
   let truncateAt = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type === "message" && entry.message?.role === "user") {
+      const entry = parseLine(lines[i]);
+      if (isUserMessage(entry)) {
         truncateAt = i;
         break;
       }
@@ -36,17 +157,16 @@ function getForkContentLines(parentSessionFile: string): string[] {
     }
   }
 
-  return lines.slice(0, truncateAt).filter((line) => {
-    try {
-      return JSON.parse(line).type !== "session";
-    } catch {
-      return true;
-    }
-  });
+  const trigger = parseLine(lines[truncateAt] ?? "");
+  return trigger
+    ? getAncestryForkContentLines(lines.slice(0, truncateAt), trigger, forkTurns)
+    : [];
 }
 
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
+  /** Defaults to all for backward-compatible full fork mode. */
+  forkTurns?: "all" | number;
   parentSessionFile: string;
   childSessionFile: string;
   childCwd: string;
@@ -60,7 +180,9 @@ export function seedSubagentSessionFile(params: {
     parentSession: params.parentSessionFile,
   };
   const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+    params.mode === "fork"
+      ? getForkContentLines(params.parentSessionFile, params.forkTurns ?? "all")
+      : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
