@@ -905,107 +905,6 @@ export function createSurfaceSplit(
 }
 
 /**
- * Rename the current tab/window.
- */
-export function renameCurrentTab(title: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    const surfaceId = process.env.CMUX_SURFACE_ID;
-    if (!surfaceId) throw new Error("CMUX_SURFACE_ID not set");
-    execSync(`cmux rename-tab --surface ${shellEscape(surfaceId)} ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_WINDOW !== "1") {
-      return;
-    }
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const windowId = execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"], {
-      encoding: "utf8",
-    }).trim();
-    execFileSync("tmux", ["rename-window", "-t", windowId, title], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    const paneId = process.env.WEZTERM_PANE;
-    const args = ["cli", "set-tab-title"];
-    if (paneId) args.push("--pane-id", paneId);
-    args.push(title);
-    execFileSync("wezterm", args, { encoding: "utf8" });
-    return;
-  }
-
-  // zellij: rename the agent's own pane, not the whole tab. In multi-pane layouts,
-  // rename-tab clobbers the user's tab title whenever a subagent starts or /plan runs.
-  // Closes #21.
-  const paneId = process.env.ZELLIJ_PANE_ID;
-  if (paneId) {
-    zellijActionSync(["rename-pane", title], `pane:${paneId}`);
-  } else {
-    zellijActionSync(["rename-pane", title]);
-  }
-}
-
-/**
- * Rename the current workspace/session where supported.
- */
-export function renameWorkspace(title: string): void {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
-      encoding: "utf8",
-    });
-    return;
-  }
-
-  if (backend === "tmux") {
-    if (process.env.PI_SUBAGENT_RENAME_TMUX_SESSION !== "1") {
-      return;
-    }
-
-    const paneId = process.env.TMUX_PANE;
-    if (!paneId) throw new Error("TMUX_PANE not set");
-    const sessionId = execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", paneId, "#{session_id}"],
-      {
-        encoding: "utf8",
-      },
-    ).trim();
-    execFileSync("tmux", ["rename-session", "-t", sessionId, title], { encoding: "utf8" });
-    return;
-  }
-
-  if (backend === "wezterm") {
-    const paneId = process.env.WEZTERM_PANE;
-    const args = ["cli", "set-window-title"];
-    if (paneId) args.push("--pane-id", paneId);
-    args.push(title);
-    try {
-      execFileSync("wezterm", args, { encoding: "utf8" });
-    } catch {
-      // Optional — window title is cosmetic.
-    }
-    return;
-  }
-
-  // Skip session rename for zellij. rename-session renames the socket file
-  // but the ZELLIJ_SESSION_NAME env var in the parent process keeps the old
-  // name, so all subsequent `zellij action ...` CLI calls fail with
-  // "There is no active session!" because the CLI can't find the socket.
-  // Additionally, pi titles often contain special characters (em dashes,
-  // spaces) that fail zellij's session name validation on lookup.
-  // rename-tab (called separately) is sufficient for user-visible naming.
-}
-
-/**
  * Send a command string to a pane and execute it.
  */
 export function sendCommand(surface: string, command: string): void {
@@ -1262,7 +1161,6 @@ export async function pollForExit(
   options: {
     interval: number;
     sessionFile?: string;
-    sentinelFile?: string;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
@@ -1281,15 +1179,6 @@ export async function pollForExit(
           const data = JSON.parse(readFileSync(exitFile, "utf8"));
           rmSync(exitFile, { force: true });
           return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
         }
       } catch {}
     }

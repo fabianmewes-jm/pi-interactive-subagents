@@ -11,8 +11,8 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
-export type SubagentStatusSource = "pi" | "claude";
+export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled";
+export type SubagentStatusSource = "pi";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
@@ -202,7 +202,6 @@ export function createStatusState(params: {
   source: SubagentStatusSource;
   startTimeMs: number;
 }): SubagentStatusState {
-  const initialKind = params.source === "claude" ? "running" : "starting";
   return {
     source: params.source,
     startTimeMs: params.startTimeMs,
@@ -218,10 +217,10 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
-    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotState: "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
-    currentKind: initialKind,
+    currentKind: "starting",
   };
 }
 
@@ -230,8 +229,6 @@ export function observeStatus(
   observation: StatusObservation,
   now: number,
 ): SubagentStatusState {
-  if (state.source === "claude") return state;
-
   if (observation.snapshot !== "present") {
     return {
       ...state,
@@ -288,8 +285,6 @@ export function observeStatus(
 }
 
 export function forceStatusAfterInterrupt(state: SubagentStatusState, now: number): SubagentStatusState {
-  if (state.source === "claude") return state;
-
   return {
     ...state,
     firstObservationAtMs: state.firstObservationAtMs ?? now,
@@ -339,25 +334,6 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
 export function classifyStatus(state: SubagentStatusState, now: number): StatusSnapshot {
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
-
-  if (state.source === "claude") {
-    return {
-      kind: "running",
-      elapsedMs,
-      elapsedText,
-      activeSinceMs: null,
-      activeDurationText: null,
-      activeScope: null,
-      waitingSinceMs: null,
-      waitingDurationText: null,
-      latestEvent: null,
-      activityLabel: null,
-      snapshotState: state.snapshotState,
-      snapshotError: null,
-      snapshotProblemText: null,
-      statusLabel: null,
-    };
-  }
 
   let kind: SubagentStatusKind;
   let statusLabel: string | null = null;
@@ -460,10 +436,6 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
   if (snapshot.kind === "starting") {
     const label = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, starting${label}.`);
-  }
-
-  if (snapshot.kind === "running") {
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}.`);
   }
 
   if (snapshot.kind === "active") {

@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, or `stalled`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -62,7 +62,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 4 main-session tools + 2 commands, plus 2 subagent-only tools (`subagent_done` and `caller_ping`). All subagents run in Pi:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -73,7 +73,6 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
-| `/plan`                    | Start a full planning workflow       |
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
 
@@ -121,7 +120,6 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 - `active` — the child is doing observed runtime work: agent turn, provider request, streaming, or tool execution
 - `waiting` — the child finished a turn and is intentionally open for more input or another stage
 - `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
-- `running` — fallback for backends without child snapshots (e.g. Claude)
 
 These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
@@ -194,8 +192,6 @@ This sends Escape to the child pane, cancelling the in-progress model turn. The 
 
 This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
 
-> **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
-
 ---
 
 ## caller_ping — Child-to-Parent Help Request
@@ -229,31 +225,6 @@ await caller_ping({
 ```
 
 > **Note:** `caller_ping` is only available inside subagent contexts. Calling it from a standalone pi session returns an error.
-
----
-
-## The `/plan` Workflow
-
-The `/plan` command orchestrates a full planning-to-implementation pipeline.
-
-```
-/plan Add a dark mode toggle to the settings page
-```
-
-```
-Phase 1: Investigation    → Quick codebase scan
-Phase 2: Planning         → Interactive planner subagent (user collaborates)
-Phase 3: Review Plan      → Confirm todos, adjust if needed
-Phase 4: Execute          → Scout + sequential workers implement todos
-Phase 5: Review           → Reviewer subagent checks all changes
-```
-
-Tab/window titles update to show current phase:
-
-```
-🔍 Investigating: dark mode → 💬 Planning: dark mode
-→ 🔨 Executing: 1/3 → 🔎 Reviewing → ✅ Done
-```
 
 ---
 
