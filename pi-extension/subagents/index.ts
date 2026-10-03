@@ -10,8 +10,6 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
-  copyFileSync,
-  unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -25,9 +23,6 @@ import {
   getMuxBackend,
   sendEscape,
   shellEscape,
-  renameCurrentTab,
-  renameWorkspace,
-  readScreen,
   isStableCmuxId,
   muxInstanceIdentity,
   ownedMuxTargetExists,
@@ -173,12 +168,6 @@ const SubagentParams = Type.Object({
     Type.Boolean({
       description:
         "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
-    }),
-  ),
-  resumeSessionId: Type.Optional(
-    Type.String({
-      description:
-        "Resume a previous Claude Code session by its ID. Loads the conversation history and continues where it left off. The session ID is returned in details of every claude tool call. Use this to retry cancelled runs or ask follow-up questions.",
     }),
   ),
 });
@@ -637,7 +626,6 @@ const statusConfig = loadStatusConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
-  if (snapshot.kind === "running") return ` running ${snapshot.elapsedText} `;
   if (snapshot.kind === "active") {
     const label = snapshot.activityLabel ?? snapshot.activeScope;
     const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
@@ -692,7 +680,6 @@ interface SubagentResult {
   task: string;
   summary: string;
   sessionFile?: string;
-  claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
   error?: string;
@@ -730,8 +717,6 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
-  cli?: string;
-  sentinelFile?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -899,9 +884,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
-      : agent.cli === "claude"
-        ? " running… "
-        : " starting… ";
+      : " starting… ";
 
     lines.push(borderLine(left, right, width));
   }
@@ -1011,8 +994,6 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude") return;
-
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
     ? readSubagentActivityFile(activityFile, running.id)
@@ -1102,17 +1083,6 @@ function handleSubagentInterrupt(
   }
 
   const running = resolved.running;
-  if (running.cli === "claude") {
-    return {
-      content: [{
-        type: "text" as const,
-        text:
-          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
-      }],
-      details: { error: "claude interrupt unsupported", id: running.id, name: running.name },
-    };
-  }
-
   const now = Date.now();
   observeRunningSubagent(running, now);
 
@@ -1325,6 +1295,7 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
+  launchSubagent,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   parseForkTurns,
@@ -1391,6 +1362,12 @@ async function launchSubagent(
 
   const definitionCwd = params.cwd ? resolve(ctx.cwd, params.cwd) : ctx.cwd;
   const agentDefs = params.agent ? loadAgentDefaults(params.agent, definitionCwd) : null;
+  if (agentDefs?.cli != null && agentDefs.cli !== "pi") {
+    throw new Error(
+      `Agent "${params.agent}" specifies unsupported cli: ${agentDefs.cli}. ` +
+      `Only Pi subagents are supported; migrate the agent definition to Pi and set cli: pi or remove the cli field.`,
+    );
+  }
   const effective = resolveEffectiveLaunchOptions(params, agentDefs);
   const effectiveModel = effective.model;
   const effectiveTools = effective.tools;
@@ -1505,89 +1482,6 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? taskWithImages
     : `${roleBlock}\n\n${modeHint}\n\n${taskWithImages}\n\n${summaryInstruction}`;
-  // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
-    const sentinelFile = `/tmp/pi-claude-${id}-done`;
-    const pluginDir = join(SUBAGENTS_DIR, "plugin");
-
-    const cmdParts: string[] = [];
-    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
-    cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
-
-    if (existsSync(pluginDir)) {
-      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
-    }
-
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
-    }
-
-    const sp = params.systemPrompt ?? agentDefs.body;
-    if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
-    }
-
-    if (params.resumeSessionId) {
-      cmdParts.push("--resume", shellEscape(params.resumeSessionId));
-    }
-
-    // Always pass the task as the prompt — even for resumed sessions,
-    // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(taskWithImages));
-
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const teamEnvPrefix = Object.entries(teamEnvironment(team, teamAgent))
-      .map(([key, value]) => `${key}=${shellEscape(value)}`)
-      .join(" ");
-    const command = `${cdPrefix}${teamEnvPrefix} ${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
-    const running: RunningSubagent = {
-      id,
-      runId,
-      incarnation: agentIncarnation(teamAgent),
-      agentPath: teamAgent.path,
-      team,
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
-      surface,
-      ownedSurface: launchedOwnership,
-      startTime,
-      sessionFile: subagentSessionFile,
-      launchScriptFile,
-      cli: "claude",
-      sentinelFile,
-      interactive: effectiveInteractive,
-      statusState: createStatusState({
-        source: "claude",
-        startTimeMs: startTime,
-      }),
-    };
-
-    runningSubagents.set(id, running);
-    return running;
-  }
-
-  // ── Pi CLI path ──
-
   // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
@@ -1762,27 +1656,6 @@ async function launchSubagent(
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
-const CLAUDE_SESSIONS_DIR = join(
-  process.env.HOME ?? "/tmp",
-  ".pi", "agent", "sessions", "claude-code",
-);
-
-function copyClaudeSession(sentinelFile: string): string | null {
-  try {
-    const transcriptFile = sentinelFile + ".transcript";
-    if (!existsSync(transcriptFile)) return null;
-    const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
-    if (!transcriptPath || !existsSync(transcriptPath)) return null;
-    mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
-    const dest = join(CLAUDE_SESSIONS_DIR, filename);
-    copyFileSync(transcriptPath, dest);
-    return filename;
-  } catch {
-    return null;
-  }
-}
-
 async function finalizeSubagentOnce(
   running: RunningSubagent,
   result: SubagentResult,
@@ -1886,37 +1759,11 @@ async function watchSubagentOnce(
     const polled = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
-      sentinelFile: running.sentinelFile,
       surfaceExists: running.surfaceExistsCheck,
       completionFilesOnly: running.completionFilesOnly,
       onTick() { observeRunningSubagent(running); },
     });
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
-
-    if (running.cli === "claude") {
-      let summary = "";
-      if (running.sentinelFile) {
-        try { summary = readFileSync(running.sentinelFile, "utf-8").trim(); } catch {}
-      }
-      if (!summary && polled.reason !== "disappeared") {
-        try {
-          summary = readScreen(surface, 200).replace(/__SUBAGENT_DONE_\d+__/, "").trimEnd();
-        } catch {}
-      }
-      if (!summary) summary = polled.errorMessage ??
-        (polled.exitCode !== 0 ? `Claude Code exited with code ${polled.exitCode}` : "Claude Code exited without output");
-      let sessionId: string | null = null;
-      if (running.sentinelFile) {
-        sessionId = copyClaudeSession(running.sentinelFile);
-        try { unlinkSync(running.sentinelFile); } catch {}
-        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
-      }
-      return finalizeSubagent(running, {
-        name, task, summary, exitCode: polled.exitCode, elapsed,
-        ...(polled.errorMessage ? { errorMessage: polled.errorMessage } : {}),
-        ...(sessionId ? { claudeSessionId: sessionId } : {}),
-      }, polled.reason === "disappeared" ? "orphaned" : "closed");
-    }
 
     const fallback = polled.errorMessage
       ? `Subagent error: ${polled.errorMessage}`
@@ -2010,9 +1857,8 @@ function reconcileTeamWatchers(pi: ExtensionAPI, ctx: ExtensionContext): void {
       sessionFile: record.sessionPath,
       launchScriptFile: typeof policy.launchScriptFile === "string" ? policy.launchScriptFile : undefined,
       activityFile: typeof policy.activityFile === "string" ? policy.activityFile : undefined,
-      cli: policy.cli === "claude" ? "claude" : undefined,
       interactive: policy.interactive === true,
-      statusState: createStatusState({ source: policy.cli === "claude" ? "claude" : "pi", startTimeMs: startTime }),
+      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
     };
     runningSubagents.set(id, running);
     const watcherAbort = new AbortController();
@@ -2311,7 +2157,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -3156,35 +3001,5 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     };
   });
 
-  // /plan command — start the full planning workflow
-  pi.registerCommand("plan", {
-    description: "Start a planning session: /plan <what to build>",
-    handler: async (args, ctx) => {
-      const task = args.trim();
-      if (!task) {
-        ctx.ui.notify("Usage: /plan <what to build>", "warning");
-        return;
-      }
-
-      // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
-        try {
-          const label = task.length > 40 ? task.slice(0, 40) + "..." : task;
-          renameWorkspace(`🎯 ${label}`);
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
-      }
-
-      // Load the plan skill from the subagents extension directory
-      const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
-      let content = readFileSync(planSkillPath, "utf8");
-      content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
-      pi.sendUserMessage(
-        `<skill name="plan" location="${planSkillPath}">\n${content.trim()}\n</skill>\n\n${task}`,
-      );
-    },
-  });
 }
 // test

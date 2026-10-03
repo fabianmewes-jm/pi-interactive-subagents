@@ -238,6 +238,11 @@ const TOOL_RESULT = {
 
 // --- Tests ---
 
+// A test run started inside a restricted subagent must still test the main-session tools.
+const inheritedDeniedTools = process.env.PI_DENY_TOOLS;
+before(() => { delete process.env.PI_DENY_TOOLS; });
+after(() => { restoreEnvVar("PI_DENY_TOOLS", inheritedDeniedTools); });
+
 describe("session.ts", () => {
   let dir: string;
 
@@ -729,14 +734,6 @@ describe("status.ts", () => {
     assert.equal(snapshot.waitingDurationText, "3m");
   });
 
-  it("uses elapsed-only fallback for claude-backed subagents", () => {
-    const state = createStatusState({ source: "claude", startTimeMs: 0 });
-    const snapshot = classifyStatus(state, 125_000);
-
-    assert.equal(snapshot.kind, "running");
-    assert.equal(snapshot.elapsedText, "2m");
-  });
-
   it("detects stalled transitions and recovery", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, { snapshot: "missing" }, 1_000);
@@ -985,6 +982,59 @@ describe("status.ts", () => {
 
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
+
+  for (const source of ["project", "global"] as const) {
+    it(`rejects non-Pi CLI defaults from ${source} agents before launch side effects`, async () => {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir, projectDir }) => {
+        const agentsDir = source === "project" ? projectAgentsDir : globalAgentsDir;
+        for (const cli of ["claude", "other-cli"]) {
+          const name = `legacy-${source}-test-agent`;
+          writeAgentFile(agentsDir, name, `name: ${name}\ncli: ${cli}`);
+          assert.equal(testApi.loadAgentDefaults(name).cli, cli);
+          const runningCount = testApi.runningSubagents.size;
+          await assert.rejects(
+            testApi.launchSubagent(
+              { name: "Legacy", task: "Test", agent: name },
+              {
+                cwd: projectDir,
+                // Session access precedes pane creation in the production launch path.
+                // Rejection must happen even before reaching this first side effect.
+                get sessionManager() {
+                  assert.fail("unsupported CLI must be rejected before session or pane setup");
+                },
+              },
+            ),
+            (error: Error) => {
+              assert.match(error.message, new RegExp(`unsupported cli: ${cli}`));
+              assert.ok(error.message.includes(name));
+              assert.match(error.message, /set cli: pi or remove the cli field/);
+              return true;
+            },
+          );
+          assert.equal(testApi.runningSubagents.size, runningCount);
+        }
+      });
+    });
+
+    it(`accepts Pi and omitted CLI defaults from ${source} agents`, async () => {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir, projectDir }) => {
+        const agentsDir = source === "project" ? projectAgentsDir : globalAgentsDir;
+        for (const cli of ["pi", undefined]) {
+          const name = `pi-${source}-test-agent`;
+          writeAgentFile(agentsDir, name, `name: ${name}${cli ? `\ncli: ${cli}` : ""}`);
+          assert.equal(testApi.loadAgentDefaults(name).cli, cli);
+          // Stop at the next prerequisite so this test never opens a real mux pane.
+          await assert.rejects(
+            testApi.launchSubagent(
+              { name: "Pi", task: "Test", agent: name },
+              { cwd: projectDir, sessionManager: { getSessionFile: () => null } },
+            ),
+            /^Error: No session file$/,
+          );
+        }
+      });
+    });
+  }
 
   it("loads session-mode from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
@@ -1243,6 +1293,23 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("keeps user-defined planner and spec agents discoverable and directly loadable", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+      writeAgentFile(globalAgentsDir, "planner", "name: planner\nmodel: test/global");
+      writeAgentFile(projectAgentsDir, "planner", "name: planner\nmodel: test/project");
+      writeAgentFile(projectAgentsDir, "spec", "name: spec\nsession-mode: lineage-only");
+
+      const { api, registeredTools } = createMockExtensionApi();
+      subagentsModule.default(api);
+      const list = registeredTools.find((tool) => tool.name === "subagents_list");
+      const result = await list.execute("tool-call", {}, undefined, undefined, {});
+      assert.equal(result.details.agents.find((agent: any) => agent.name === "planner").model, "test/project");
+      assert.ok(result.details.agents.some((agent: any) => agent.name === "spec"));
+      assert.equal(testApi.loadAgentDefaults("planner").model, "test/project");
+      assert.equal(testApi.loadAgentDefaults("spec").sessionMode, "lineage-only");
+    });
+  });
+
   it("lists visible agents from discovery", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1474,6 +1541,22 @@ describe("cmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
+  it("registers the retained commands and all Pi orchestration tools", () => {
+    const { api, registeredCommands, registeredTools } = createMockExtensionApi();
+    subagentsModule.default(api);
+
+    assert.deepEqual(registeredCommands.map((command) => command.name).sort(), ["iterate", "subagent"]);
+    assert.deepEqual(registeredTools.map((tool) => tool.name).sort(), [
+      "subagent", "subagent_followup", "subagent_interrupt", "subagent_message",
+      "subagent_resume", "subagents_list", "subagents_team",
+    ]);
+    const spawn = registeredTools.find((tool) => tool.name === "subagent");
+    assert.deepEqual(Object.keys(spawn.parameters.properties).sort(), [
+      "agent", "cwd", "fork", "forkTurns", "interactive", "model", "name", "skills",
+      "systemPrompt", "task", "taskName", "thinking", "tools",
+    ]);
+  });
+
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
@@ -2401,31 +2484,6 @@ describe("subagent interruption", () => {
 
       assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
       assert.equal(runningMap.has("a1"), true);
-    } finally {
-      runningMap.clear();
-    }
-  });
-
-  it("rejects Claude-backed interrupt requests before delivery", () => {
-    const testApi = (subagentsModule as any).__test__;
-    const runningMap = testApi.runningSubagents as Map<string, any>;
-    let delivered = false;
-    runningMap.clear();
-
-    try {
-      runningMap.set("a1", makeRunning({ cli: "claude" }));
-
-      const result = testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
-        delivered = true;
-      });
-
-      assert.equal(delivered, false);
-      assert.match(result.content[0].text, /currently supported only for Pi-backed subagents/i);
-      assert.deepEqual(result.details, {
-        error: "claude interrupt unsupported",
-        id: "a1",
-        name: "Worker",
-      });
     } finally {
       runningMap.clear();
     }
